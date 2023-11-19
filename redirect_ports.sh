@@ -41,5 +41,8 @@ fi
 iptables -t nat -I PREROUTING --src 0/0 --dst 127.0.0.1 -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
 iptables -t nat -I PREROUTING --src 0/0 --dst 127.0.0.1 -p udp --dport "$src" -j REDIRECT --to-ports "$target"
 # Redirect for internal users
-iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1. -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
-iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1. -p udp --dport "$src" -j REDIRECT --to-ports "$target"
+iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1 -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
+iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1 -p udp --dport "$src" -j REDIRECT --to-ports "$target"
+
+
+iptables-save

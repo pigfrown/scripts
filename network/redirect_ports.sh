@@ -40,8 +40,5 @@ fi
 # Redirect for external users
 iptables -t nat -A PREROUTING -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
 iptables -t nat -A PREROUTING -p udp --dport "$src" -j REDIRECT --to-ports "$target"
-# Redirect for internal users
-iptables -t nat -A OUTPUT -p udp --dport "$src" -j REDIRECT --to-ports "$target"
-iptables -t nat -A OUTPUT -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
 
 iptables-save

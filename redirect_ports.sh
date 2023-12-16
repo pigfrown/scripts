@@ -38,11 +38,10 @@ if ! is_positive_integer "$target" ; then
 fi
 
 # Redirect for external users
-iptables -t nat -I PREROUTING --src 0/0 --dst 127.0.0.1 -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
-iptables -t nat -I PREROUTING --src 0/0 --dst 127.0.0.1 -p udp --dport "$src" -j REDIRECT --to-ports "$target"
+iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-ports 3000
+iptables -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports 3000
 # Redirect for internal users
-iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1 -p tcp --dport "$src" -j REDIRECT --to-ports "$target"
-iptables -t nat -I OUTPUT --src 0/0 --dst 127.0.0.1 -p udp --dport "$src" -j REDIRECT --to-ports "$target"
-
+iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 3000
+iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 3000
 
 iptables-save

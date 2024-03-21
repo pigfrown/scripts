@@ -42,3 +42,8 @@ iptables -t nat -A PREROUTING -p tcp --dport "$src" -j REDIRECT --to-ports "$tar
 iptables -t nat -A PREROUTING -p udp --dport "$src" -j REDIRECT --to-ports "$target"
 
 iptables-save > /etc/rules/rules.v4
+
+dpkg -s iptables-persistent &> /dev/null
+if [ $? -ne 0 ] ; then
+	echo "Warning.. iptables-persistent is not installed... rules will survive reboot"
+fi

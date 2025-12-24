@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+
+DEFAULT_CONTAINER_ID=9999
+DEFAULT_TARGET=shrew
+CONTAINER=${1:-${DEFAULT_CONTAINER_ID}}
+TARGET=${2:-${DEFAULT_TARGET}}
+
+
+pct stop $CONTAINER
+pct move-volume $CONTAINER rootfs $TARGET
+pct start $CONTAINER

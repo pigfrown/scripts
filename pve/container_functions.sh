@@ -49,10 +49,18 @@ update_debian() {
 # Load a template (convert back to a normal container), update it, then
 # re-create the template.
 #
-# In Proxmox a template cannot be started, so to update it we:
+# In Proxmox a template is really two things: the `template: 1` flag in the
+# config AND a disk stored as a base volume (basevol-<id>-disk-N). A template
+# can't be started, so to update it we just toggle the flag:
 #   1. Clear the template flag        ("load")
 #   2. Start it, run update_debian, stop it
 #   3. Set the template flag again    ("recreate")
+#
+# Note: we do NOT use `pct template` to re-create. That command only converts a
+# normal disk into a base volume (the first-time conversion); on an already-
+# templated container the disk is already a basevol, so it fails with
+# "Template feature is not available for '<storage>:basevol-...'". Re-adding the
+# config flag is all that's needed.
 #
 # Usage: update_template [CTID-or-name]   (defaults to CTID 999)
 update_template() {
@@ -93,19 +101,25 @@ update_template() {
   if ! update_debian "$ctid"; then
     echo "Update failed; stopping CT ${ctid} and restoring template flag." >&2
     pct stop "$ctid" || true
-    [[ $was_template -eq 1 ]] && pct template "$ctid"
+    [[ $was_template -eq 1 ]] && _set_template_flag "$conf"
     return 1
   fi
 
   echo "Stopping CT ${ctid}..."
   pct stop "$ctid"
 
-  # 3. Recreate: set the template flag again.
+  # 3. Recreate: set the template flag again (the disk is already a basevol).
   if [[ $was_template -eq 1 ]]; then
     echo "Recreating template from CT ${ctid}..."
-    pct template "$ctid"
+    _set_template_flag "$conf"
     echo "✔ Template CT ${ctid} updated and re-created."
   else
     echo "✔ CT ${ctid} updated (left as a normal container)."
   fi
+}
+
+# Add `template: 1` to the main section of a container config, unless already set.
+_set_template_flag() {
+  local conf="$1"
+  grep -q '^template: 1$' "$conf" || sed -i '1i template: 1' "$conf"
 }

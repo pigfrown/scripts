@@ -5,7 +5,8 @@ Source the files to load the functions:
 
 ```bash
 source ./container_functions.sh
-source ./docker_functions.sh   # auto-sources container_functions.sh
+source ./docker_functions.sh     # auto-sources container_functions.sh
+source ./redeploy_functions.sh   # auto-sources the other two
 ```
 
 All functions accept a **CTID or a container name** (resolved via `pct list`).
@@ -49,6 +50,47 @@ Override the tag name per shell with `DOCKER_PROTECT_TAG=mytag`.
 | `validate_all_docker` | Run the validator across every container (skips protected). | — |
 | `convert_to_standard <ct> [--apply]` | Migrate each project to `/opt/<project>/`. **Dry-run by default**; refuses protected containers. | 0/1/2 |
 | `convert_all_docker [--apply]` | Run the converter across every eligible container (docker + not protected). **Dry-run by default**. | — |
+| `compose_up_all <ct>` | `docker compose up -d` for every `/opt/<app>/docker-compose.yml`. | 0/2 |
+
+## redeploy_functions.sh — cattle-style rebuilds
+
+Destroy a container and recreate a fresh one from a template, as a **drop-in
+replacement**: same CTID, same MAC/VLAN/bridge/IP, same bind mounts, same
+idmap, same `/opt` payload — but on a fresh OS/template. The point is to stop
+hand-`dist-upgrade`ing pets and instead reprovision from a known-good template.
+
+What's preserved (read off the old config):
+
+- **Identity:** CTID (reused), `net*` lines verbatim (MAC, VLAN `tag`, bridge, IP/gw), hostname.
+- **Resources & flags:** cores, memory, swap, onboot, startup, arch, features, tags.
+- **Mounts:** bind mounts (host paths, e.g. ZFS media) re-attached. **Storage-backed
+  volumes are detected and the redeploy aborts** rather than let `pct destroy` wipe them.
+- **idmap / raw `lxc.*`** lines.
+- **`/opt`** (on rootfs): tar'd off the old CT and restored into the clone.
+
+What's NOT carried: docker images and named volumes (images re-pulled on
+`compose up`; the pattern keeps real data in bind mounts under `/opt`).
+
+| Function | What it does |
+| --- | --- |
+| `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. |
+| `rollback_lxc <ct> [backup]` | Restore from the vzdump taken during redeploy. With no file, uses the latest backup for that CTID. Leaves the CT stopped. |
+
+Flow (on `--apply`): stop docker → tar `/opt` → **vzdump backup** → destroy →
+`pct clone --full` template into the same CTID → stamp saved config back on →
+start → restore `/opt` → `compose_up_all`. Aborts on any failed step with the
+exact `rollback_lxc` command to recover.
+
+```bash
+redeploy_lxc 118              # preview what would happen
+redeploy_lxc 118 --apply      # rebuild CT 118 from template 999
+redeploy_lxc 118 debian13 --apply   # rebuild from a named template
+rollback_lxc 118             # undo: restore the pre-redeploy backup
+```
+
+Config (env vars): `REDEPLOY_TEMPLATE` (default 999), `REDEPLOY_BACKUP_STORAGE`
+(default `local`, needs "backup" content), `REDEPLOY_CLONE_STORAGE` (blank =
+template's storage).
 
 ### convert_to_standard
 

@@ -143,6 +143,21 @@ convert_all_docker() {
   done
 }
 
+# Bring up every compose stack found under /opt/<app>/docker-compose.yml.
+# Usage: compose_up_all <CTID-or-name>
+compose_up_all() {
+  local ctid
+  ctid=$(_resolve_ctid "${1:-}") || return 2
+  ct_has_docker "$ctid" || { echo "CT ${ctid}: no docker."; return 2; }
+  pct exec "$ctid" -- bash -c '
+    find /opt -maxdepth 2 -type f -name docker-compose.yml 2>/dev/null | while read -r f; do
+      d=$(dirname "$f")
+      echo "compose up: $d"
+      ( cd "$d" && docker compose up -d )
+    done
+  ' </dev/null
+}
+
 # Print a step, then either run it in the container (apply) or just show it.
 # Returns non-zero if the executed command fails.
 # Usage: _ct_step <ctid> <apply 0|1> <description> <command>

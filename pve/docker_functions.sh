@@ -320,9 +320,19 @@ convert_to_standard() {
   local keep_arr
   IFS=', ' read -r -a keep_arr <<< "${keep_override:-$DOCKER_STANDARD_KEEP_BINDS}"
 
-  local ctid ct_hostname
+  local ctid ct_hostname pct_conf
   ctid=$(_resolve_ctid "${args[0]:-}") || return 2
-  ct_hostname=$(pct config "$ctid" | awk '/^hostname:/{print $2}')
+  pct_conf=$(pct config "$ctid")
+  ct_hostname=$(awk '/^hostname:/{print $2}' <<< "$pct_conf")
+
+  # LXC-side paths of host passthrough mounts (mp0: /host/path,mp=/lxc/path,...)
+  local host_mps=()
+  while IFS= read -r mp_path; do
+    [[ -n "$mp_path" ]] && host_mps+=("$mp_path")
+  done < <(awk '/^mp[0-9]+:/{
+    n=split($0,a,",")
+    for(i=1;i<=n;i++) if(a[i]~/^mp=/) { sub(/^mp=/,"",a[i]); print a[i] }
+  }' <<< "$pct_conf")
 
   if _ct_is_protected "$ctid"; then
     echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — refusing to convert."
@@ -404,6 +414,8 @@ convert_to_standard() {
     #   - volume bind  : source is a <dir>/volumes/<name> tree (produced by
     #                    migrate_volumes_to_binds; name already project-prefixed)
     #                    -> centralise as /opt/volumes/<name>, rewrite compose;
+    #   - host-mount   : source is at or under a PVE host passthrough mount point
+    #                    (mp0/mp1/... in the LXC config) -> left in place;
     #   - data bind    : other project-local source whose dir is NOT in the keep
     #                    list -> centralise as /opt/volumes/<name>_<rel> (prefixed
     #                    to avoid collisions), rewrite compose;
@@ -417,7 +429,7 @@ convert_to_standard() {
       done | sort -u
     " </dev/null)
 
-    local moves=() volmoves=() top k kept
+    local moves=() volmoves=() top k kept is_host_mp mp
     while IFS='|' read -r bsrc bdst; do
       [[ -z "$bsrc" || "$bsrc" == "$cf" ]] && continue
       if [[ "$bsrc" =~ /volumes/([^/]+)/?$ ]]; then
@@ -428,20 +440,31 @@ convert_to_standard() {
           volmoves+=("${bsrc}|/opt/volumes/${vol_name}|${bdst}")
           echo "  volume bind : ${bsrc}  ->  /opt/volumes/${vol_name}   (at ${bdst})"
         fi
-      elif [[ "$bsrc" == "${wd%/}/"* ]]; then
-        rel=${bsrc#${wd%/}/}
-        top=${rel%%/*}
-        kept=0
-        for k in "${keep_arr[@]}"; do [[ -n "$k" && "$top" == "$k" ]] && { kept=1; break; }; done
-        if [[ $kept -eq 1 ]]; then
-          moves+=("$bsrc|${target}/${rel}")
-          echo "  config bind : ${bsrc}  (kept with project)"
-        else
-          volmoves+=("${bsrc}|/opt/volumes/${name}_${rel}|${bdst}")
-          echo "  data bind   : ${bsrc}  ->  /opt/volumes/${name}_${rel}   (at ${bdst})"
-        fi
       else
-        echo "  EXTERNAL    : ${bsrc}  (left in place)"
+        # Check whether bsrc is (or is under) a host passthrough mount point
+        is_host_mp=0
+        for mp in "${host_mps[@]}"; do
+          if [[ "$bsrc" == "$mp" || "$bsrc" == "${mp%/}/"* ]]; then
+            is_host_mp=1; break
+          fi
+        done
+        if [[ $is_host_mp -eq 1 ]]; then
+          echo "  host-mount  : ${bsrc}  (LXC passthrough — left in place)"
+        elif [[ "$bsrc" == "${wd%/}/"* ]]; then
+          rel=${bsrc#${wd%/}/}
+          top=${rel%%/*}
+          kept=0
+          for k in "${keep_arr[@]}"; do [[ -n "$k" && "$top" == "$k" ]] && { kept=1; break; }; done
+          if [[ $kept -eq 1 ]]; then
+            moves+=("$bsrc|${target}/${rel}")
+            echo "  config bind : ${bsrc}  (kept with project)"
+          else
+            volmoves+=("${bsrc}|/opt/volumes/${name}_${rel}|${bdst}")
+            echo "  data bind   : ${bsrc}  ->  /opt/volumes/${name}_${rel}   (at ${bdst})"
+          fi
+        else
+          echo "  EXTERNAL    : ${bsrc}  (left in place)"
+        fi
       fi
     done <<< "$binds"
 

@@ -274,20 +274,27 @@ _sed_escape_re() { printf '%s' "$1" | sed 's/[^[:alnum:]_-]/\\&/g'; }
 _sed_escape_repl() { printf '%s' "$1" | sed 's/[&\\#]/\\&/g'; }
 
 # Convert a container to the standard layout:
-#   /opt/<project>/docker-compose.yml  with project-local bind mounts moved
-#   alongside it, and migrated volume data centralised under a shared
-#   /opt/volumes/<name> tree. External (shared) bind mounts are reported and
-#   left in place.
+#   /opt/<project>/docker-compose.yml  with the compose file and its config
+#   binds under /opt/<project>, and persistent data centralised under a shared
+#   /opt/volumes tree. External (shared) bind mounts are reported and left in
+#   place.
 #
 # For each running compose project it: backs up the compose file + working dir,
-# `compose down`, moves project-local dirs and the compose file under /opt/<app>,
-# centralises any <dir>/volumes/<name> bind (as produced by
-# migrate_volumes_to_binds) into /opt/volumes/<name> and rewrites the compose
-# source to match, then `compose up -d` from the new location.
+# `compose down`, moves the compose file and config binds under /opt/<app>, and
+# centralises persistent-data binds under /opt/volumes — rewriting each compose
+# source to match — then `compose up -d` from the new location. Data binds are:
+#   - any <dir>/volumes/<name> bind (as produced by migrate_volumes_to_binds),
+#     kept as /opt/volumes/<name> (the name is already project-prefixed);
+#   - any other project-local bind whose top-level dir is NOT in the keep list
+#     (see DOCKER_STANDARD_KEEP_BINDS / --keep), placed at
+#     /opt/volumes/<name>_<rel> — prefixed with the project name to avoid
+#     collisions in the shared tree.
+# Config binds (top-level dir in the keep list, e.g. certs/config) stay with the
+# project.
 #
-# Because the volume-centralising step is independent of the project move, this
-# is safe to re-run on an already-conformant project (compose already in /opt)
-# to adopt the shared /opt/volumes layout — only the volume binds are touched.
+# Because the centralising step is independent of the project move, this is safe
+# to re-run on an already-conformant project (compose already in /opt) to adopt
+# the shared /opt/volumes layout — only the data binds are touched.
 #
 # DRY-RUN by default — prints the plan. Pass --apply to make changes.
 # Aborts on the first failed step (after --apply) so you can inspect.
@@ -304,9 +311,15 @@ _sed_escape_repl() { printf '%s' "$1" | sed 's/[&\\#]/\\&/g'; }
 # Refuses to convert a container that has docker volumes in use (see
 # check_volumes) — they wouldn't survive the move. Pass --force to override.
 #
+# Project-local binds whose top-level dir name is in this list are treated as
+# config that lives with the compose file and are NOT centralised under
+# /opt/volumes. Override per-run with --keep, or globally via this env var.
+: "${DOCKER_STANDARD_KEEP_BINDS:=certs config}"
+
 # Usage: convert_to_standard <CTID-or-name> [--name <app>] [--apply] [--force]
+#                            [--keep <csv>]
 convert_to_standard() {
-  local apply=0 a name_override="" force=0
+  local apply=0 a name_override="" force=0 keep_override=""
   local args=()
   while [[ $# -gt 0 ]]; do
     a=$1
@@ -315,10 +328,16 @@ convert_to_standard() {
       --force) force=1 ;;
       --name) name_override=$2; shift ;;
       --name=*) name_override=${a#--name=} ;;
+      --keep) keep_override=$2; shift ;;
+      --keep=*) keep_override=${a#--keep=} ;;
       *) args+=("$a") ;;
     esac
     shift
   done
+
+  # config dir names to keep with the project (vs centralise under /opt/volumes)
+  local keep_arr
+  IFS=', ' read -r -a keep_arr <<< "${keep_override:-$DOCKER_STANDARD_KEEP_BINDS}"
 
   local ctid
   ctid=$(_resolve_ctid "${args[0]:-}") || return 2
@@ -401,10 +420,14 @@ convert_to_standard() {
 
     # Enumerate this project's bind mounts (with destinations) and classify:
     #   - volume bind  : source is a <dir>/volumes/<name> tree (produced by
-    #                    migrate_volumes_to_binds) -> centralise under the shared
-    #                    /opt/volumes/<name> and rewrite the compose source;
-    #   - local bind   : other source under the working dir -> moves alongside
-    #                    the project into /opt/<name> (relative refs follow it);
+    #                    migrate_volumes_to_binds; name already project-prefixed)
+    #                    -> centralise as /opt/volumes/<name>, rewrite compose;
+    #   - data bind    : other project-local source whose dir is NOT in the keep
+    #                    list -> centralise as /opt/volumes/<name>_<rel> (prefixed
+    #                    to avoid collisions), rewrite compose;
+    #   - config bind  : project-local source whose dir IS in the keep list ->
+    #                    stays with the project (moves into /opt/<name> if the
+    #                    project itself is relocating; relative refs follow it);
     #   - external     : anything else -> left in place.
     binds=$(pct exec "$ctid" -- bash -c "
       for id in \$(docker ps -q --filter label=com.docker.compose.project=${proj}); do
@@ -412,7 +435,7 @@ convert_to_standard() {
       done | sort -u
     " </dev/null)
 
-    local moves=() volmoves=()
+    local moves=() volmoves=() top k kept
     while IFS='|' read -r bsrc bdst; do
       [[ -z "$bsrc" || "$bsrc" == "$cf" ]] && continue
       if [[ "$bsrc" =~ /volumes/([^/]+)/?$ ]]; then
@@ -425,8 +448,16 @@ convert_to_standard() {
         fi
       elif [[ "$bsrc" == "${wd%/}/"* ]]; then
         rel=${bsrc#${wd%/}/}
-        moves+=("$bsrc|${target}/${rel}")
-        echo "  local bind  : ${bsrc}  ->  ${target}/${rel}"
+        top=${rel%%/*}
+        kept=0
+        for k in "${keep_arr[@]}"; do [[ -n "$k" && "$top" == "$k" ]] && { kept=1; break; }; done
+        if [[ $kept -eq 1 ]]; then
+          moves+=("$bsrc|${target}/${rel}")
+          echo "  config bind : ${bsrc}  (kept with project)"
+        else
+          volmoves+=("${bsrc}|/opt/volumes/${name}_${rel}|${bdst}")
+          echo "  data bind   : ${bsrc}  ->  /opt/volumes/${name}_${rel}   (at ${bdst})"
+        fi
       else
         echo "  EXTERNAL    : ${bsrc}  (left in place)"
       fi

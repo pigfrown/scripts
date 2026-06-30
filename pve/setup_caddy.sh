@@ -7,8 +7,8 @@ PORT="${2:-}"
 
 CADDYFILE="/etc/caddy/Caddyfile"
 CERT_DIR="/opt/certs"
-CRT="${CERT_DIR}/crt.pem"
-KEY="${CERT_DIR}/prv.pem"
+CRT="${CERT_DIR}/${HOSTNAME}_crt.pem"
+KEY="${CERT_DIR}/${HOSTNAME}_prv.pem"
 
 if [[ -z "$HOSTNAME" || -z "$PORT" ]]; then
   echo "Usage: $0 <hostname> <port>"

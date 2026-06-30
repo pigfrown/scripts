@@ -259,9 +259,11 @@ _ct_step() {
 # By default the target dir is /opt/<compose-project>, where the compose
 # project name defaults to the working-dir basename (e.g. a compose file in
 # /root yields project 'root' -> /opt/root). Pass --name <app> to place the
-# project under /opt/<app> instead. This only changes the on-disk location;
-# the compose project name (-p) is left untouched so named volumes keep their
-# project prefix and aren't orphaned.
+# project under /opt/<app> instead; the stack is also brought back up under
+# that name (-p <app>), so the running project matches its new home. The
+# `down` still uses the original project name to match what's running. This
+# rename is safe because the volume check below guarantees no named volumes
+# exist that a new project prefix would orphan.
 #
 # Refuses to convert a container that has docker volumes in use (see
 # check_volumes) — they wouldn't survive the move. Pass --force to override.
@@ -400,8 +402,11 @@ convert_to_standard() {
     _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
       "mv '${cf}' '${target_compose}'" || return 1
 
-    _ct_step "$ctid" "$apply" "compose up -d from ${target}" \
-      "cd '${target}' && docker compose -f '${target_compose}' -p '${proj}' up -d" || return 1
+    # Bring up under the (possibly renamed) project so the running stack matches
+    # its new /opt/<name> home. Safe to rename here: check_volumes already
+    # guaranteed no named volumes exist that a new prefix would orphan.
+    _ct_step "$ctid" "$apply" "compose up -d from ${target} (project '${name}')" \
+      "cd '${target}' && docker compose -f '${target_compose}' -p '${name}' up -d" || return 1
 
   done <<< "$meta"
 

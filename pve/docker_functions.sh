@@ -275,11 +275,19 @@ _sed_escape_repl() { printf '%s' "$1" | sed 's/[&\\#]/\\&/g'; }
 
 # Convert a container to the standard layout:
 #   /opt/<project>/docker-compose.yml  with project-local bind mounts moved
-#   alongside it. External (shared) bind mounts are reported and left in place.
+#   alongside it, and migrated volume data centralised under a shared
+#   /opt/volumes/<name> tree. External (shared) bind mounts are reported and
+#   left in place.
 #
 # For each running compose project it: backs up the compose file + working dir,
 # `compose down`, moves project-local dirs and the compose file under /opt/<app>,
-# then `compose up -d` from the new location.
+# centralises any <dir>/volumes/<name> bind (as produced by
+# migrate_volumes_to_binds) into /opt/volumes/<name> and rewrites the compose
+# source to match, then `compose up -d` from the new location.
+#
+# Because the volume-centralising step is independent of the project move, this
+# is safe to re-run on an already-conformant project (compose already in /opt)
+# to adopt the shared /opt/volumes layout — only the volume binds are touched.
 #
 # DRY-RUN by default — prints the plan. Pass --apply to make changes.
 # Aborts on the first failed step (after --apply) so you can inspect.
@@ -363,7 +371,8 @@ convert_to_standard() {
   fi
 
   local backup_dir="/root/compose-migration-$(date +%Y%m%d-%H%M%S)"
-  local proj wd cf name target target_compose binds b rel m src dst
+  local proj wd cf name target target_compose binds bsrc bdst rel m src dst
+  local moves volmoves vol_name needs_move cf_now wd_now esc_dest repl sed_expr
   while IFS='|' read -r proj wd cf; do
     [[ -z "$proj" ]] && continue
 
@@ -390,29 +399,62 @@ convert_to_standard() {
     echo "  workdir : ${wd}"
     echo "  target  : ${target_compose}"
 
-    if [[ "$cf" == "$target_compose" ]]; then
+    # Enumerate this project's bind mounts (with destinations) and classify:
+    #   - volume bind  : source is a <dir>/volumes/<name> tree (produced by
+    #                    migrate_volumes_to_binds) -> centralise under the shared
+    #                    /opt/volumes/<name> and rewrite the compose source;
+    #   - local bind   : other source under the working dir -> moves alongside
+    #                    the project into /opt/<name> (relative refs follow it);
+    #   - external     : anything else -> left in place.
+    binds=$(pct exec "$ctid" -- bash -c "
+      for id in \$(docker ps -q --filter label=com.docker.compose.project=${proj}); do
+        docker inspect \$id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}|{{.Destination}}{{\"\n\"}}{{end}}{{end}}'
+      done | sort -u
+    " </dev/null)
+
+    local moves=() volmoves=()
+    while IFS='|' read -r bsrc bdst; do
+      [[ -z "$bsrc" || "$bsrc" == "$cf" ]] && continue
+      if [[ "$bsrc" =~ /volumes/([^/]+)/?$ ]]; then
+        vol_name=${BASH_REMATCH[1]}
+        if [[ "$bsrc" == "/opt/volumes/${vol_name}" ]]; then
+          echo "  volume bind : ${bsrc}  (already centralised)"
+        else
+          volmoves+=("${bsrc}|/opt/volumes/${vol_name}|${bdst}")
+          echo "  volume bind : ${bsrc}  ->  /opt/volumes/${vol_name}   (at ${bdst})"
+        fi
+      elif [[ "$bsrc" == "${wd%/}/"* ]]; then
+        rel=${bsrc#${wd%/}/}
+        moves+=("$bsrc|${target}/${rel}")
+        echo "  local bind  : ${bsrc}  ->  ${target}/${rel}"
+      else
+        echo "  EXTERNAL    : ${bsrc}  (left in place)"
+      fi
+    done <<< "$binds"
+
+    # Work is needed if the compose file must relocate to /opt/<name>, and/or any
+    # volume bind still needs centralising under /opt/volumes (the latter lets us
+    # re-run on already-conformant projects to adopt the shared layout).
+    needs_move=0
+    [[ "$cf" != "$target_compose" ]] && needs_move=1
+    if [[ $needs_move -eq 0 && ${#volmoves[@]} -eq 0 ]]; then
       echo "  -> already conformant."
       continue
     fi
 
-    # project-local bind mounts move with the project; external ones don't
-    binds=$(pct exec "$ctid" -- bash -c "
-      for id in \$(docker ps -q --filter label=com.docker.compose.project=${proj}); do
-        docker inspect \$id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}{{\"\n\"}}{{end}}{{end}}'
-      done | sort -u
-    " </dev/null)
-
-    local moves=()
-    while read -r b; do
-      [[ -z "$b" || "$b" == "$cf" ]] && continue
-      if [[ "$b" == "${wd%/}/"* ]]; then
-        rel=${b#${wd%/}/}
-        moves+=("$b|${target}/${rel}")
-        echo "  local bind  : ${b}  ->  ${target}/${rel}"
-      else
-        echo "  EXTERNAL    : ${b}  (left in place)"
+    # Pre-flight: never clobber an existing /opt/volumes/<name>; bail before we
+    # touch the running stack so nothing is left half-migrated.
+    for m in "${volmoves[@]}"; do
+      dst=${m#*|}; dst=${dst%|*}
+      if [[ $apply -eq 1 ]] && pct exec "$ctid" -- bash -c "[ -e '${dst}' ]" </dev/null; then
+        if [[ $force -eq 1 ]]; then
+          echo "  ! ${dst} already exists — --force given, proceeding anyway."
+        else
+          echo "  ! ${dst} already exists — refusing (remove it or pass --force)."
+          return 2
+        fi
       fi
-    done <<< "$binds"
+    done
 
     _ct_step "$ctid" "$apply" "backup compose+workdir to ${backup_dir}/${proj}" \
       "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
@@ -420,23 +462,74 @@ convert_to_standard() {
     _ct_step "$ctid" "$apply" "compose down" \
       "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || return 1
 
-    _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
+    # Relocate the project itself into /opt/<name> (skipped if already there).
+    cf_now="$cf"; wd_now="$wd"
+    if [[ $needs_move -eq 1 ]]; then
+      _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
+      for m in "${moves[@]}"; do
+        src=${m%%|*}
+        dst=${m##*|}
+        _ct_step "$ctid" "$apply" "move ${src} -> ${dst}" \
+          "mkdir -p '$(dirname "$dst")' && mv '${src}' '${dst}'" || return 1
+      done
+      _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
+        "mv '${cf}' '${target_compose}'" || return 1
+      cf_now="$target_compose"; wd_now="$target"
+    fi
 
-    for m in "${moves[@]}"; do
-      src=${m%%|*}
-      dst=${m##*|}
-      _ct_step "$ctid" "$apply" "move ${src} -> ${dst}" \
-        "mkdir -p '$(dirname "$dst")' && mv '${src}' '${dst}'" || return 1
-    done
+    # Centralise volume binds under the shared /opt/volumes and repoint the
+    # compose source at the new path.
+    if [[ ${#volmoves[@]} -gt 0 ]]; then
+      _ct_step "$ctid" "$apply" "create /opt/volumes" "mkdir -p '/opt/volumes'" || return 1
+      for m in "${volmoves[@]}"; do
+        src=${m%%|*}
+        rel=${m##*|}                 # mount destination (anchors the rewrite)
+        dst=${m#*|}; dst=${dst%|*}    # /opt/volumes/<name>
+        _ct_step "$ctid" "$apply" "centralise ${src} -> ${dst}" \
+          "mv '${src}' '${dst}'" || return 1
+        # Rewrite the bind whose mount destination is ${rel} to source ${dst}.
+        # Anchoring on the (unique) destination works whether the file used an
+        # absolute or relative source; tolerate a trailing slash / mode / quotes.
+        esc_dest=$(_sed_escape_re "$rel")
+        repl=$(_sed_escape_repl "$dst")
+        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)[^:[:space:]]+(:'"${esc_dest}"'/?(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\2#'
+        _ct_step "$ctid" "$apply" "rewrite compose source -> ${dst}" \
+          "sed -i -E '${sed_expr}' '${cf_now}'" || return 1
+      done
+    fi
 
-    _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
-      "mv '${cf}' '${target_compose}'" || return 1
-
-    # Bring up under the (possibly renamed) project so the running stack matches
-    # its new /opt/<name> home. Safe to rename here: check_volumes already
+    # Bring the stack back up from its (possibly new) home under the (possibly
+    # renamed) project name. Safe to rename here: check_volumes already
     # guaranteed no named volumes exist that a new prefix would orphan.
-    _ct_step "$ctid" "$apply" "compose up -d from ${target} (project '${name}')" \
-      "cd '${target}' && docker-compose -f '${target_compose}' -p '${name}' up -d" || return 1
+    _ct_step "$ctid" "$apply" "compose up -d from ${wd_now} (project '${name}')" \
+      "cd '${wd_now}' && docker-compose -f '${cf_now}' -p '${name}' up -d" || return 1
+
+    # ---------- verify (apply only) ----------
+    # Confirm every centralised volume is now served from /opt/volumes on the
+    # running stack. A silent compose-rewrite miss (e.g. a long-form mount the
+    # short-form sed can't match) would leave the container bound to the old,
+    # now-moved source — docker would recreate it empty — which this catches.
+    if [[ $apply -eq 1 && ${#volmoves[@]} -gt 0 ]]; then
+      local mounted leftover=""
+      mounted=$(pct exec "$ctid" -- bash -c "
+        for id in \$(docker ps -q --filter label=com.docker.compose.project=${name}); do
+          docker inspect \$id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}{{\"\n\"}}{{end}}{{end}}'
+        done | sort -u
+      " </dev/null)
+      for m in "${volmoves[@]}"; do
+        dst=${m#*|}; dst=${dst%|*}
+        grep -qxF "$dst" <<< "$mounted" || leftover+=" ${dst}"
+      done
+      if [[ -n "$leftover" ]]; then
+        echo "  ! VERIFY FAILED: not mounted from /opt/volumes:${leftover}"
+        echo "    The compose rewrite did not take (long-form mount / unusual syntax?)."
+        echo "    Data is safely centralised in /opt/volumes and backed up in"
+        echo "    ${backup_dir}/${proj}; fix the source(s) in ${cf_now} by hand, then:"
+        echo "      pct exec ${ctid} -- bash -c \"cd '${wd_now}' && docker-compose -f '${cf_now}' -p '${name}' up -d\""
+        return 1
+      fi
+      echo "  ✔ verified: volume bind(s) now served from /opt/volumes"
+    fi
 
   done <<< "$meta"
 

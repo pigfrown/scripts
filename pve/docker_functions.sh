@@ -408,7 +408,7 @@ convert_to_standard() {
 
   local backup_dir="/root/compose-migration-$(date +%Y%m%d-%H%M%S)"
   local proj wd cf name target target_compose binds bsrc bdst rel m src dst
-  local moves volmoves vol_name needs_move cf_now wd_now esc_dest repl sed_expr
+  local moves volmoves vol_name needs_move moves_pending cf_now wd_now esc_dest repl sed_expr
   while IFS='|' read -r proj wd cf; do
     [[ -z "$proj" ]] && continue
 
@@ -493,12 +493,22 @@ convert_to_standard() {
       fi
     done <<< "$binds"
 
-    # Work is needed if the compose file must relocate to /opt/<name>, and/or any
-    # volume bind still needs centralising under /opt/volumes (the latter lets us
-    # re-run on already-conformant projects to adopt the shared layout).
+    # A config bind still needs to move if its source isn't already at the
+    # per-project target (e.g. compose already lives at /opt/docker-compose.yml
+    # but its config dir is still flat under /opt rather than /opt/<name>).
+    moves_pending=0
+    for m in "${moves[@]}"; do
+      IFS='|' read -r src dst bdst <<< "$m"
+      [[ "$src" != "$dst" ]] && moves_pending=1
+    done
+
+    # Work is needed if the compose file must relocate to /opt/<name>, a config
+    # bind must move into the per-project target, and/or any volume bind still
+    # needs centralising under /opt/volumes (the latter lets us re-run on
+    # already-conformant projects to adopt the shared layout).
     needs_move=0
     [[ "$cf" != "$target_compose" ]] && needs_move=1
-    if [[ $needs_move -eq 0 && ${#volmoves[@]} -eq 0 ]]; then
+    if [[ $needs_move -eq 0 && ${#volmoves[@]} -eq 0 && $moves_pending -eq 0 ]]; then
       echo "  -> already conformant."
       continue
     fi
@@ -548,8 +558,11 @@ convert_to_standard() {
       "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || return 1
 
     # Relocate the project itself into /opt/<name> (skipped if already there).
+    # This must run whenever a config bind needs to move, even if the compose
+    # file is already sitting at ${target_compose} (e.g. it was deployed flat
+    # under /opt directly, rather than relocated here from elsewhere).
     cf_now="$cf"; wd_now="$wd"
-    if [[ $needs_move -eq 1 ]]; then
+    if [[ $needs_move -eq 1 || $moves_pending -eq 1 ]]; then
       _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
       for m in "${moves[@]}"; do
         IFS='|' read -r src dst bdst <<< "$m"
@@ -557,15 +570,18 @@ convert_to_standard() {
         _ct_step "$ctid" "$apply" "move ${src} -> ${dst}" \
           "mkdir -p '$(dirname "$dst")' && mv '${src}' '${dst}'" || return 1
       done
-      _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
-        "mv '${cf}' '${target_compose}'" || return 1
-      cf_now="$target_compose"; wd_now="/opt"
-      # Rewrite config-bind sources in the (now-moved) compose file. Relative refs
-      # like ./config would still resolve correctly after the move, but absolute refs
-      # (e.g. /opt/config) point at the old location which no longer exists.
-      # Anchoring on the container destination is source-format-agnostic.
+      if [[ $needs_move -eq 1 ]]; then
+        _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
+          "mv '${cf}' '${target_compose}'" || return 1
+        cf_now="$target_compose"; wd_now="/opt"
+      fi
+      # Rewrite config-bind sources in the compose file. Relative refs like
+      # ./config would still resolve correctly after the move, but absolute
+      # refs (e.g. /opt/config) point at the old location which no longer
+      # exists. Anchoring on the container destination is source-format-agnostic.
       for m in "${moves[@]}"; do
         IFS='|' read -r src dst bdst <<< "$m"
+        [[ "$src" == "$dst" ]] && continue
         esc_dest=$(_sed_escape_re "$bdst")
         repl=$(_sed_escape_repl "$dst")
         sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)[^:[:space:]]+(:'"${esc_dest}"'/?(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\2#'
@@ -1125,7 +1141,6 @@ EOF
     restart: unless-stopped
     ports:
       - 443:443
-      - 443:443/udp
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - /opt/certs:/certs:ro

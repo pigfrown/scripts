@@ -493,7 +493,7 @@ convert_to_standard() {
     done
 
     _ct_step "$ctid" "$apply" "backup compose+workdir to ${backup_dir}/${proj}" \
-      "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
+      "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' --one-file-system -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
 
     _ct_step "$ctid" "$apply" "compose down" \
       "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || return 1

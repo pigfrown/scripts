@@ -215,7 +215,7 @@ EOF
   pct exec "$ctid" -- bash -c 'systemctl stop docker docker.socket 2>/dev/null || true' </dev/null
 
   echo "[2] Archiving /opt -> ${optfile}..."
-  pct exec "$ctid" -- tar czf - -C / opt </dev/null > "$optfile" \
+  pct exec "$ctid" -- tar czf - --one-file-system -C / opt </dev/null > "$optfile" \
     || { echo "tar /opt failed" >&2; return 1; }
 
   if (( ${#preserve_paths[@]} )); then

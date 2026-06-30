@@ -636,13 +636,23 @@ migrate_volumes_to_binds() {
       while IFS='|' read -r vname dest; do
         [[ -z "$vname" ]] && continue
         bind="${wd%/}/${subdir}/${vname}"
-        local esc_name esc_dest repl sed_expr
+        local esc_name esc_dest repl sed_expr name_alt short
+        # docker reports the *prefixed* volume name (e.g. root_mealie-data), but
+        # the compose file references the compose-local key (mealie-data). Match
+        # either form so the rewrite hits short-form refs as well as explicit/
+        # external names that carry the full name verbatim.
         esc_name=$(_sed_escape_re "$vname")
+        name_alt="$esc_name"
+        short="${vname#"${proj}"_}"
+        if [[ "$short" != "$vname" && -n "$short" ]]; then
+          name_alt="${esc_name}|$(_sed_escape_re "$short")"
+        fi
         esc_dest=$(_sed_escape_re "$dest")
         repl=$(_sed_escape_repl "$bind")
         # match a short-form list item `- [<q>]NAME:DEST[:mode][<q>]` anchored on
         # both NAME and DEST so only the right line changes; keep any quotes/mode.
-        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)'"${esc_name}"'(:'"${esc_dest}"'(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\2#'
+        # \1 = leading, \2 = the name (alternation), \3 = trailing (DEST + mode/q).
+        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)('"${name_alt}"')(:'"${esc_dest}"'(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\3#'
         _ct_step "$ctid" "$apply" "rewrite compose: ${vname}:${dest} -> bind" \
           "sed -i -E '${sed_expr}' '${cf}'" || { pfail=1; break; }
       done <<< "$named_pairs"

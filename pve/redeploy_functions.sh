@@ -25,7 +25,7 @@ _REDEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   || source "${_REDEPLOY_DIR}/docker_functions.sh"
 
 # Defaults — override in your shell/env.
-REDEPLOY_TEMPLATE="${REDEPLOY_TEMPLATE:-999}"               # template CTID to clone
+REDEPLOY_TEMPLATE="${REDEPLOY_TEMPLATE:-118}"               # template CTID to clone
 REDEPLOY_BACKUP_STORAGE="${REDEPLOY_BACKUP_STORAGE:-local}" # vzdump target (needs "backup" content)
 REDEPLOY_BACKUP_KEEP="${REDEPLOY_BACKUP_KEEP:-3}"           # vzdump backups to keep per CT (auto-pruned)
 REDEPLOY_CLONE_STORAGE="${REDEPLOY_CLONE_STORAGE:-}"        # storage for new rootfs (blank = template's)

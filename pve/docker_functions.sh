@@ -4,9 +4,8 @@
 #
 # The pattern these containers follow:
 #   - docker installed and running
-#   - a docker-compose file; the "one true location" is namespaced per project:
-#         /opt/<project>/docker-compose.yml
-#   - project-local bind mounts live under the same dir (e.g. /opt/<project>/config)
+#   - a single docker-compose file at /opt/docker-compose.yml covering all apps
+#   - each app's files live under /opt/<app>/ (e.g. /opt/radarr/config)
 #
 # Not every container uses docker; those are reported as "not applicable" and
 # skipped, never modified.
@@ -25,7 +24,8 @@ _DOCKER_FUNCS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   DOCKER_TAG          allowlist — only CTs carrying it are considered
 #   DOCKER_PROTECT_TAG  denylist  — CTs carrying it are NEVER acted on
 #   DOCKER_STANDARD_TAG marker    — set by convert_to_standard once a CT has
-#                                   been moved to the standard /opt/<app> layout;
+#                                   been moved to the standard layout
+#                                   (/opt/docker-compose.yml + /opt/<app>/);
 #                                   redeploy_lxc requires it before it will run.
 # Tag a CT with e.g.:  pct set <id> --tags docker
 # (note: --tags REPLACES the whole list, so include all: --tags docker;noauto)
@@ -110,10 +110,10 @@ validate_docker_pattern() {
     return 1
   fi
   count=$(printf '%s\n' "$files" | grep -c .)
-  nonconf=$(printf '%s\n' "$files" | grep -vE '^/opt/[^/]+/docker-compose\.yml$' || true)
+  nonconf=$(printf '%s\n' "$files" | grep -vE '^/opt/docker-compose\.yml$' || true)
 
   if [[ -z "$nonconf" ]]; then
-    echo "CT ${ctid}: ✔ conformant (${count} project(s) under /opt/<app>/)."
+    echo "CT ${ctid}: ✔ conformant (compose at /opt/docker-compose.yml)."
     return 0
   fi
 
@@ -152,18 +152,20 @@ convert_all_docker() {
   done
 }
 
-# Bring up every compose stack found under /opt/<app>/docker-compose.yml.
+# Bring up all apps defined in /opt/docker-compose.yml.
 # Usage: compose_up_all <CTID-or-name>
 compose_up_all() {
   local ctid
   ctid=$(_resolve_ctid "${1:-}") || return 2
   ct_has_docker "$ctid" || { echo "CT ${ctid}: no docker."; return 2; }
   pct exec "$ctid" -- bash -c '
-    find /opt -maxdepth 2 -type f -name docker-compose.yml 2>/dev/null | while read -r f; do
-      d=$(dirname "$f")
-      echo "compose up: $d"
-      ( cd "$d" && docker-compose up -d )
-    done
+    f=/opt/docker-compose.yml
+    if [ ! -f "$f" ]; then
+      echo "no /opt/docker-compose.yml found" >&2
+      exit 1
+    fi
+    echo "compose up: /opt"
+    cd /opt && docker-compose up -d
   ' </dev/null
 }
 
@@ -278,10 +280,10 @@ _compose_longform_sources() {
 }
 
 # Convert a container to the standard layout:
-#   /opt/<project>/docker-compose.yml  with the compose file and its config
-#   binds under /opt/<project>, and persistent data centralised under a shared
-#   /opt/volumes tree. External (shared) bind mounts are reported and left in
-#   place.
+#   /opt/docker-compose.yml  — single compose file covering all apps on the CT
+#   /opt/<project>/          — each app's config binds live here
+#   /opt/volumes/            — persistent data centralised here
+#   External (shared) bind mounts are reported and left in place.
 #
 # For each running compose project it: backs up the compose file + working dir,
 # `compose down`, moves the compose file and config binds under /opt/<app>, and
@@ -425,7 +427,7 @@ convert_to_standard() {
 
     name=${name_override:-${ct_hostname:-$proj}}
     target="/opt/${name}"
-    target_compose="${target}/docker-compose.yml"
+    target_compose="/opt/docker-compose.yml"
 
     echo
     echo "Project '${proj}':"
@@ -501,6 +503,14 @@ convert_to_standard() {
       continue
     fi
 
+    # Pre-flight: if the compose file must move to /opt/docker-compose.yml but
+    # one already exists there (from a prior app), we cannot merge automatically.
+    if [[ $needs_move -eq 1 ]] && pct exec "$ctid" -- bash -c "[ -f '/opt/docker-compose.yml' ]" </dev/null; then
+      echo "  ! /opt/docker-compose.yml already exists — cannot overwrite."
+      echo "    Merge '${cf}' into /opt/docker-compose.yml by hand, then re-run."
+      return 2
+    fi
+
     # Pre-flight: never clobber an existing /opt/volumes/<name>; bail before we
     # touch the running stack so nothing is left half-migrated.
     for m in "${volmoves[@]}"; do
@@ -548,7 +558,7 @@ convert_to_standard() {
       done
       _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
         "mv '${cf}' '${target_compose}'" || return 1
-      cf_now="$target_compose"; wd_now="$target"
+      cf_now="$target_compose"; wd_now="/opt"
       # Rewrite config-bind sources in the (now-moved) compose file. Relative refs
       # like ./config would still resolve correctly after the move, but absolute refs
       # (e.g. /opt/config) point at the old location which no longer exists.

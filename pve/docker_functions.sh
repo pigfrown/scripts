@@ -162,7 +162,7 @@ compose_up_all() {
     find /opt -maxdepth 2 -type f -name docker-compose.yml 2>/dev/null | while read -r f; do
       d=$(dirname "$f")
       echo "compose up: $d"
-      ( cd "$d" && docker compose up -d )
+      ( cd "$d" && docker-compose up -d )
     done
   ' </dev/null
 }
@@ -388,7 +388,7 @@ convert_to_standard() {
       "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
 
     _ct_step "$ctid" "$apply" "compose down" \
-      "cd '${wd}' && docker compose -f '${cf}' -p '${proj}' down" || return 1
+      "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || return 1
 
     _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
 
@@ -406,7 +406,7 @@ convert_to_standard() {
     # its new /opt/<name> home. Safe to rename here: check_volumes already
     # guaranteed no named volumes exist that a new prefix would orphan.
     _ct_step "$ctid" "$apply" "compose up -d from ${target} (project '${name}')" \
-      "cd '${target}' && docker compose -f '${target_compose}' -p '${name}' up -d" || return 1
+      "cd '${target}' && docker-compose -f '${target_compose}' -p '${name}' up -d" || return 1
 
   done <<< "$meta"
 

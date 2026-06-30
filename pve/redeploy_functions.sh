@@ -235,12 +235,11 @@ EOF
   fi
 
   echo "[3] vzdump backup (rollback point)..."
-  local bkout
-  bkout=$(vzdump "$ctid" --mode stop --compress zstd --storage "$REDEPLOY_BACKUP_STORAGE" \
-            --prune-backups "keep-last=${REDEPLOY_BACKUP_KEEP}" 2>&1) \
-    || { echo "$bkout" >&2; echo "vzdump failed — nothing destroyed." >&2; return 1; }
-  backup_file=$(sed -n "s/.*creating vzdump archive '\([^']*\)'.*/\1/p" <<<"$bkout" | tail -1)
-  echo "      backup: ${backup_file:-<see vzdump output above>}"
+  # --mode stop: the CT is about to be destroyed, so a cold-consistent dump.
+  backup_file=$(backup_lxc "$ctid" --storage "$REDEPLOY_BACKUP_STORAGE" \
+                  --keep "$REDEPLOY_BACKUP_KEEP" --mode stop) \
+    || { echo "vzdump failed — nothing destroyed." >&2; return 1; }
+  echo "      backup: ${backup_file}"
   pct status "$ctid" | grep -q stopped || pct stop "$ctid" || true
 
   echo "[4] Destroying old CT ${ctid}..."

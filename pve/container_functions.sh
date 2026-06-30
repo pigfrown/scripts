@@ -11,6 +11,13 @@
 
 DEFAULT_TEMPLATE_CTID=999
 
+# vzdump backup defaults (used by backup_lxc; redeploy_lxc passes its own
+# overrides). Override in your shell/env.
+BACKUP_STORAGE="${BACKUP_STORAGE:-local}"    # vzdump target (needs "backup" content)
+BACKUP_KEEP="${BACKUP_KEEP:-3}"              # backups kept per CT (auto-pruned)
+BACKUP_MODE="${BACKUP_MODE:-snapshot}"       # snapshot | suspend | stop
+BACKUP_COMPRESS="${BACKUP_COMPRESS:-zstd}"   # none | lzo | gzip | zstd
+
 # Resolve a CTID or container name to a CTID.
 # Usage: _resolve_ctid <CTID-or-name>
 _resolve_ctid() {
@@ -122,4 +129,69 @@ update_template() {
 _set_template_flag() {
   local conf="$1"
   grep -q '^template: 1$' "$conf" || sed -i '1i template: 1' "$conf"
+}
+
+# Take a full vzdump backup of a container — its config + every PVE-managed
+# volume (rootfs and storage-backed mountpoints). Host bind mounts are NOT
+# included (that's external data living outside the CT). This is the same
+# archive redeploy_lxc takes as its rollback point, so any backup in these
+# scripts goes through here.
+#
+# The archive lands on $BACKUP_STORAGE and old ones are auto-pruned to the last
+# $BACKUP_KEEP per CT. Defaults come from the BACKUP_* vars above; flags
+# override per-call. vzdump's own output streams to stderr; the resulting
+# archive path is printed to stdout (and nothing else), so callers can capture
+# it:  file=$(backup_lxc 118)
+#
+# Must run as root on the Proxmox host.
+# Usage: backup_lxc <CTID-or-name> [--storage S] [--keep N] [--mode M] [--compress C]
+backup_lxc() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Run as root on the Proxmox host" >&2
+    return 1
+  fi
+
+  local storage="$BACKUP_STORAGE" keep="$BACKUP_KEEP" mode="$BACKUP_MODE" compress="$BACKUP_COMPRESS"
+  local a pos=()
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    case "$a" in
+      --storage)    storage=$2; shift ;;
+      --storage=*)  storage=${a#--storage=} ;;
+      --keep)       keep=$2; shift ;;
+      --keep=*)     keep=${a#--keep=} ;;
+      --mode)       mode=$2; shift ;;
+      --mode=*)     mode=${a#--mode=} ;;
+      --compress)   compress=$2; shift ;;
+      --compress=*) compress=${a#--compress=} ;;
+      *)            pos+=("$a") ;;
+    esac
+    shift
+  done
+
+  local ctid
+  ctid=$(_resolve_ctid "${pos[0]:-}") || return 1
+  [[ -f "/etc/pve/lxc/${ctid}.conf" ]] || { echo "No such CT: ${ctid}" >&2; return 1; }
+
+  echo "vzdump CT ${ctid} (mode ${mode}, ${compress}) -> ${storage}, keep-last=${keep}..." >&2
+  # Capture vzdump's output (to parse the archive path) but replay it to stderr,
+  # so the caller's stdout stays clean — just the archive path. Direct
+  # assignment keeps $? as vzdump's own exit status (no masking pipe).
+  local out rc
+  out=$(vzdump "$ctid" --mode "$mode" --compress "$compress" --storage "$storage" \
+          --prune-backups "keep-last=${keep}" 2>&1); rc=$?
+  printf '%s\n' "$out" >&2
+  if [[ $rc -ne 0 ]]; then
+    echo "vzdump failed for CT ${ctid}." >&2
+    return 1
+  fi
+
+  local file
+  file=$(sed -n "s/.*creating vzdump archive '\([^']*\)'.*/\1/p" <<<"$out" | tail -1)
+  if [[ -z "$file" ]]; then
+    echo "backup_lxc: could not parse archive path from vzdump output (see above)." >&2
+    return 1
+  fi
+  echo "✔ CT ${ctid} backed up: ${file}" >&2
+  printf '%s\n' "$file"
 }

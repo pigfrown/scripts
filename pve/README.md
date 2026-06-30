@@ -17,6 +17,37 @@ All functions accept a **CTID or a container name** (resolved via `pct list`).
 | --- | --- |
 | `update_debian <ct>` | `apt update && upgrade -y && autoremove -y` inside the container. |
 | `update_template [ct]` | Update a template (default CTID 999): clears the `template:` flag, starts, updates, stops, re-sets the flag. Toggles the flag in `/etc/pve/lxc/<id>.conf` — it does **not** run `pct template` (the disk is already a basevol). Root + host only. |
+| `backup_lxc <ct> [--storage S] [--keep N] [--mode M] [--compress C]` | Full `vzdump` of the CT (config + PVE-managed volumes), pruned to the last N per CT. Prints the archive path on stdout (progress on stderr). The single backup helper every script uses. Root + host only. |
+
+### backups: `backup_lxc`
+
+`backup_lxc` is the one place these scripts call `vzdump`. It takes a full
+backup of a container — its config and every PVE-managed volume (rootfs +
+storage-backed mountpoints). **Host bind mounts are not included** (that's
+external data outside the CT). The archive lands on `$BACKUP_STORAGE` and old
+ones are auto-pruned to the last `$BACKUP_KEEP` per CT.
+
+It prints the resulting archive path on **stdout** and nothing else (vzdump's
+progress and the success line go to stderr), so you can capture it:
+
+```bash
+backup_lxc 118                       # back up, using BACKUP_* defaults
+file=$(backup_lxc 118)               # capture the archive path
+backup_lxc 118 --mode stop --keep 5  # cold dump, keep the last 5
+```
+
+Defaults come from these env vars (override in your shell):
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `BACKUP_STORAGE` | `local` | vzdump target (storage must allow "backup" content) |
+| `BACKUP_KEEP` | `3` | backups kept per CT (`--prune-backups keep-last`) |
+| `BACKUP_MODE` | `snapshot` | `snapshot` (no downtime, needs snapshot-capable storage) / `suspend` / `stop` |
+| `BACKUP_COMPRESS` | `zstd` | `none` / `lzo` / `gzip` / `zstd` |
+
+`redeploy_lxc` takes its rollback backup through `backup_lxc` too (with
+`--mode stop`, since the CT is about to be destroyed), honouring its own
+`REDEPLOY_BACKUP_STORAGE` / `REDEPLOY_BACKUP_KEEP` knobs.
 
 ## docker_functions.sh
 
@@ -123,8 +154,8 @@ $EDITOR /etc/pve/redeploy/118.preserve     # list the paths worth keeping
 
 ### Backups: storage, retention, rollback
 
-`redeploy_lxc` takes a full `vzdump` of the CT (mode `stop`, zstd) **before**
-destroying it — this is the rollback point. It lands on
+`redeploy_lxc` takes a full backup of the CT via `backup_lxc` (mode `stop`,
+zstd) **before** destroying it — this is the rollback point. It lands on
 `$REDEPLOY_BACKUP_STORAGE` (default `local` → `/var/lib/vz/dump/` on the host's
 local filesystem). Point it at a NAS dir-storage or a Proxmox Backup Server
 datastore by exporting `REDEPLOY_BACKUP_STORAGE=<storage>`.

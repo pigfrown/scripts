@@ -1096,18 +1096,8 @@ add_caddy() {
     fi
   fi
 
-  # --- Detect cert/key basenames under /opt/certs ---
-  local crt_file prv_file
-  crt_file=$(pct exec "$ctid" -- bash -c '
-    f=$(find /opt/certs -maxdepth 1 -name "*.pem" 2>/dev/null | grep -iE "crt|cert" | head -1)
-    [ -n "$f" ] && basename "$f"
-  ' </dev/null)
-  prv_file=$(pct exec "$ctid" -- bash -c '
-    f=$(find /opt/certs -maxdepth 1 -name "*.pem" 2>/dev/null | grep -iE "prv|key|private" | head -1)
-    [ -n "$f" ] && basename "$f"
-  ' </dev/null)
-  crt_file="${crt_file:-crt.pem}"
-  prv_file="${prv_file:-prv.pem}"
+  # --- Cert/key basenames under /opt/certs ---
+  local crt_file="crt.pem" prv_file="prv.pem"
 
   local site="${ct_hostname}.home.arpa"
 
@@ -1122,12 +1112,12 @@ add_caddy() {
   local caddyfile
   caddyfile="$(cat <<EOF
 (certs) {
-    tls /certs/${crt_file} /certs/${prv_file}
+	tls /certs/${crt_file} /certs/${prv_file}
 }
 
 ${site} {
-    import certs
-    reverse_proxy ${service_name}:${port}
+	import certs
+	reverse_proxy ${service_name}:${port}
 }
 EOF
 )"

@@ -167,6 +167,67 @@ compose_up_all() {
   ' </dev/null
 }
 
+# Report docker *volume* mounts (named or anonymous) used by running containers.
+# These live in docker's storage, not on the project tree, so they are NOT
+# carried across by convert_to_standard / a redeploy — data in them is lost
+# unless migrated by hand. Bind mounts are excluded (they travel with the dir).
+# Prints a verdict and returns:
+#   0  no volumes  (safe to redeploy)
+#   1  volumes in use  (review before redeploying)
+#   2  n/a          (no docker — skip this container)
+# Usage: check_volumes <CTID-or-name>
+check_volumes() {
+  local ctid
+  ctid=$(_resolve_ctid "${1:-}") || return 2
+
+  if ! ct_has_docker "$ctid"; then
+    echo "CT ${ctid}: no docker — not applicable, skipping."
+    return 2
+  fi
+
+  # container<TAB>project<TAB>volume<TAB>destination, one line per volume mount
+  local vols
+  vols=$(pct exec "$ctid" -- bash -c '
+    docker ps --format "{{.ID}}" 2>/dev/null | while read -r id; do
+      cname=$(docker inspect "$id" --format "{{.Name}}" 2>/dev/null | sed "s#^/##")
+      proj=$(docker inspect "$id" --format "{{ index .Config.Labels \"com.docker.compose.project\" }}" 2>/dev/null)
+      docker inspect "$id" --format "{{range .Mounts}}{{if eq .Type \"volume\"}}${cname}|{{if .Name}}{{.Name}}{{else}}<anon>{{end}}|{{.Destination}}|${proj}{{\"\n\"}}{{end}}{{end}}" 2>/dev/null
+    done | sort -u
+  ' </dev/null)
+
+  if [[ -z "$vols" ]]; then
+    echo "CT ${ctid}: ✔ no docker volumes in use — safe to redeploy."
+    return 0
+  fi
+
+  local count
+  count=$(printf '%s\n' "$vols" | grep -c .)
+  echo "CT ${ctid}: ⚠ ${count} docker volume(s) in use — data will NOT survive a redeploy:"
+  local cname vname dest proj note
+  while IFS='|' read -r cname vname dest proj; do
+    [[ -z "$cname" ]] && continue
+    note=""
+    # 64-char hex volume name == anonymous volume
+    [[ "$vname" =~ ^[0-9a-f]{64}$ || "$vname" == "<anon>" ]] && note="  (anonymous)"
+    printf '  %-20s %s -> %s%s\n' "${proj:-?}/${cname}" "$vname" "$dest" "$note"
+  done <<< "$vols"
+  return 1
+}
+
+# Run check_volumes across every CT tagged '${DOCKER_TAG}', skipping protected.
+# Usage: check_all_volumes
+check_all_volumes() {
+  local ctid
+  for ctid in $(pct list | awk 'NR>1 {print $1}'); do
+    _ct_has_tag "$ctid" "$DOCKER_TAG" || continue
+    if _ct_is_protected "$ctid"; then
+      echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — skipping."
+      continue
+    fi
+    check_volumes "$ctid"
+  done
+}
+
 # Print a step, then either run it in the container (apply) or just show it.
 # Returns non-zero if the executed command fails.
 # Usage: _ct_step <ctid> <apply 0|1> <description> <command>
@@ -194,15 +255,31 @@ _ct_step() {
 #
 # DRY-RUN by default — prints the plan. Pass --apply to make changes.
 # Aborts on the first failed step (after --apply) so you can inspect.
-# Usage: convert_to_standard <CTID-or-name> [--apply]
+#
+# By default the target dir is /opt/<compose-project>, where the compose
+# project name defaults to the working-dir basename (e.g. a compose file in
+# /root yields project 'root' -> /opt/root). Pass --name <app> to place the
+# project under /opt/<app> instead. This only changes the on-disk location;
+# the compose project name (-p) is left untouched so named volumes keep their
+# project prefix and aren't orphaned.
+#
+# Refuses to convert a container that has docker volumes in use (see
+# check_volumes) — they wouldn't survive the move. Pass --force to override.
+#
+# Usage: convert_to_standard <CTID-or-name> [--name <app>] [--apply] [--force]
 convert_to_standard() {
-  local apply=0 a
+  local apply=0 a name_override="" force=0
   local args=()
-  for a in "$@"; do
+  while [[ $# -gt 0 ]]; do
+    a=$1
     case "$a" in
       --apply) apply=1 ;;
+      --force) force=1 ;;
+      --name) name_override=$2; shift ;;
+      --name=*) name_override=${a#--name=} ;;
       *) args+=("$a") ;;
     esac
+    shift
   done
 
   local ctid
@@ -216,6 +293,15 @@ convert_to_standard() {
   if ! ct_has_docker "$ctid"; then
     echo "CT ${ctid}: no docker — not applicable, skipping."
     return 2
+  fi
+
+  if ! check_volumes "$ctid"; then
+    if [[ $force -eq 1 ]]; then
+      echo "CT ${ctid}: volumes present but --force given — proceeding anyway."
+    else
+      echo "CT ${ctid}: docker volumes in use (above) — refusing to convert. Pass --force to override."
+      return 2
+    fi
   fi
 
   local mode="DRY-RUN"
@@ -235,8 +321,17 @@ convert_to_standard() {
     return 1
   fi
 
+  if [[ -n "$name_override" ]]; then
+    local nproj
+    nproj=$(printf '%s\n' "$meta" | grep -c .)
+    if [[ "$nproj" -gt 1 ]]; then
+      echo "CT ${ctid}: --name given but ${nproj} compose projects found — ambiguous, refusing."
+      return 2
+    fi
+  fi
+
   local backup_dir="/root/compose-migration-$(date +%Y%m%d-%H%M%S)"
-  local proj wd cf target target_compose binds b rel m src dst
+  local proj wd cf name target target_compose binds b rel m src dst
   while IFS='|' read -r proj wd cf; do
     [[ -z "$proj" ]] && continue
 
@@ -253,7 +348,8 @@ convert_to_standard() {
       continue
     fi
 
-    target="/opt/${proj}"
+    name=${name_override:-$proj}
+    target="/opt/${name}"
     target_compose="${target}/docker-compose.yml"
 
     echo

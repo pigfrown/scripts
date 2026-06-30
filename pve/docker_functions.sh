@@ -21,17 +21,25 @@ _DOCKER_FUNCS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ $(type -t _resolve_ctid) == function ]] \
   || source "${_DOCKER_FUNCS_DIR}/container_functions.sh"
 
-# Containers carrying this PVE tag are NEVER acted on (opt-out / denylist).
-# Tag one with:  pct set <id> --tags ${DOCKER_PROTECT_TAG:-noauto}
+# PVE tags that drive eligibility for the bulk helpers:
+#   DOCKER_TAG          allowlist — only CTs carrying it are considered
+#   DOCKER_PROTECT_TAG  denylist  — CTs carrying it are NEVER acted on
+# Tag a CT with e.g.:  pct set <id> --tags docker
+# (note: --tags REPLACES the whole list, so include all: --tags docker;noauto)
+DOCKER_TAG="${DOCKER_TAG:-docker}"
 DOCKER_PROTECT_TAG="${DOCKER_PROTECT_TAG:-noauto}"
 
-# True if the container carries the protect tag.
-# Usage: _ct_is_protected <CTID>
-_ct_is_protected() {
-  local ctid="$1" tags
-  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
-  [[ ";${tags};" == *";${DOCKER_PROTECT_TAG};"* ]]
+# True if the container's config carries the given tag.
+# Usage: _ct_has_tag <CTID> <tag>
+_ct_has_tag() {
+  local tags
+  tags=$(pct config "$1" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  [[ ";${tags};" == *";${2};"* ]]
 }
+
+# True if the container carries the protect (denylist) tag.
+# Usage: _ct_is_protected <CTID>
+_ct_is_protected() { _ct_has_tag "$1" "$DOCKER_PROTECT_TAG"; }
 
 # True if the container has docker installed and the daemon is running.
 # Usage: ct_has_docker <CTID-or-name>
@@ -114,12 +122,13 @@ validate_docker_pattern() {
   return 1
 }
 
-# Run validate_docker_pattern across every container on the host,
-# skipping containers tagged with the protect tag.
+# Run validate_docker_pattern across every CT tagged '${DOCKER_TAG}',
+# skipping those also tagged with the protect tag.
 # Usage: validate_all_docker
 validate_all_docker() {
   local ctid
   for ctid in $(pct list | awk 'NR>1 {print $1}'); do
+    _ct_has_tag "$ctid" "$DOCKER_TAG" || continue
     if _ct_is_protected "$ctid"; then
       echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — skipping."
       continue
@@ -128,17 +137,17 @@ validate_all_docker() {
   done
 }
 
-# Run convert_to_standard across every eligible container on the host
-# (has docker, not protected). DRY-RUN by default; pass --apply to commit.
+# Run convert_to_standard across every eligible CT
+# (tagged '${DOCKER_TAG}', not protected). DRY-RUN by default; --apply to commit.
 # Usage: convert_all_docker [--apply]
 convert_all_docker() {
   local ctid
   for ctid in $(pct list | awk 'NR>1 {print $1}'); do
+    _ct_has_tag "$ctid" "$DOCKER_TAG" || continue
     if _ct_is_protected "$ctid"; then
       echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — skipping."
       continue
     fi
-    ct_has_docker "$ctid" || continue
     convert_to_standard "$ctid" "$@"
   done
 }

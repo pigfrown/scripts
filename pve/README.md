@@ -30,17 +30,33 @@ Compose files are discovered from **running containers' labels**
 the real on-disk location (`/opt`, `~`, `/opt/app`, …) doesn't need guessing.
 If nothing is running, it falls back to a filesystem search.
 
-### Protecting containers (denylist)
+### Eligibility: two PVE tags
 
-Opt-out via a **PVE tag**. Any container carrying the protect tag (default
-`noauto`) is never converted and is skipped by the bulk helpers:
+The bulk helpers (`validate_all_docker`, `convert_all_docker`) decide what to
+act on using two tags:
+
+| Tag | Role | Default | Override |
+| --- | --- | --- | --- |
+| `docker` | **allowlist** — only CTs with this tag are considered | `docker` | `DOCKER_TAG` |
+| `noauto` | **denylist** — CTs with this tag are never touched | `noauto` | `DOCKER_PROTECT_TAG` |
+
+> **eligible = tagged `docker`  AND NOT tagged `noauto`**
 
 ```bash
-pct set 118 --tags noauto          # never touch CT 118
+pct set 118 --tags docker          # opt CT 118 in
+pct set 118 --tags docker;noauto   # in the fleet, but temporarily protected
 ```
 
-Override the tag name per shell with `DOCKER_PROTECT_TAG=mytag`.
-(Containers without docker are also skipped automatically.)
+`pct set --tags` **replaces** the whole tag list, so always pass every tag you
+want the CT to keep.
+
+Notes:
+
+- **Single-CT calls** (`convert_to_standard 118`, `validate_docker_pattern 118`)
+  ignore the `docker` allowlist — calling them by ID is itself opt-in — but
+  `convert_to_standard` still **refuses** a `noauto` container.
+- The `docker` tag is just an eligibility flag; the functions still verify
+  docker is actually installed/running at runtime (`ct_has_docker`).
 
 | Function | What it does | Returns |
 | --- | --- | --- |

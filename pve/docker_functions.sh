@@ -651,8 +651,10 @@ migrate_volumes_to_binds() {
         repl=$(_sed_escape_repl "$bind")
         # match a short-form list item `- [<q>]NAME:DEST[:mode][<q>]` anchored on
         # both NAME and DEST so only the right line changes; keep any quotes/mode.
+        # docker normalises DEST (strips a trailing slash) but the file may keep
+        # one (`/app/data/`), so tolerate an optional trailing slash on DEST.
         # \1 = leading, \2 = the name (alternation), \3 = trailing (DEST + mode/q).
-        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)('"${name_alt}"')(:'"${esc_dest}"'(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\3#'
+        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)('"${name_alt}"')(:'"${esc_dest}"'/?(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\3#'
         _ct_step "$ctid" "$apply" "rewrite compose: ${vname}:${dest} -> bind" \
           "sed -i -E '${sed_expr}' '${cf}'" || { pfail=1; break; }
       done <<< "$named_pairs"

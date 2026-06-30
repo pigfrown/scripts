@@ -553,6 +553,7 @@ convert_to_standard() {
       _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
       for m in "${moves[@]}"; do
         IFS='|' read -r src dst bdst <<< "$m"
+        [[ "$src" == "$dst" ]] && continue
         _ct_step "$ctid" "$apply" "move ${src} -> ${dst}" \
           "mkdir -p '$(dirname "$dst")' && mv '${src}' '${dst}'" || return 1
       done

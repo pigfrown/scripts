@@ -114,7 +114,26 @@ $EDITOR /etc/pve/redeploy/118.preserve     # list the paths worth keeping
 | --- | --- |
 | `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over, including preserved paths). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. |
 | `rollback_lxc <ct> [backup]` | Restore from the vzdump taken during redeploy. With no file, uses the latest backup for that CTID. Leaves the CT stopped. |
+| `list_backups <ct>` | List the vzdump backups held for a CT on the backup storage. |
 | `ct_changed_files <ct>` | Show base-system drift (modified package files + unpackaged config files) to help build the preserve manifest. |
+
+### Backups: storage, retention, rollback
+
+`redeploy_lxc` takes a full `vzdump` of the CT (mode `stop`, zstd) **before**
+destroying it — this is the rollback point. It lands on
+`$REDEPLOY_BACKUP_STORAGE` (default `local` → `/var/lib/vz/dump/` on the host's
+local filesystem). Point it at a NAS dir-storage or a Proxmox Backup Server
+datastore by exporting `REDEPLOY_BACKUP_STORAGE=<storage>`.
+
+Retention is automatic: each run passes `--prune-backups
+keep-last=$REDEPLOY_BACKUP_KEEP` (default **3**), so only the last N backups per
+CT are kept and old ones are pruned — they won't silently fill the disk.
+
+```bash
+list_backups 118             # what's held for CT 118
+rollback_lxc 118             # restore the newest (then: pct start 118)
+rollback_lxc 118 local:backup/vzdump-lxc-118-2026_06_30-10_00_00.tar.zst   # a specific one
+```
 
 Flow (on `--apply`): stop docker → tar `/opt` (+ preserve manifest) → **vzdump
 backup** → destroy → `pct clone --full` template into the same CTID → stamp

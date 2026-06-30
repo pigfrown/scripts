@@ -27,6 +27,7 @@ _REDEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Defaults — override in your shell/env.
 REDEPLOY_TEMPLATE="${REDEPLOY_TEMPLATE:-999}"               # template CTID to clone
 REDEPLOY_BACKUP_STORAGE="${REDEPLOY_BACKUP_STORAGE:-local}" # vzdump target (needs "backup" content)
+REDEPLOY_BACKUP_KEEP="${REDEPLOY_BACKUP_KEEP:-3}"           # vzdump backups to keep per CT (auto-pruned)
 REDEPLOY_CLONE_STORAGE="${REDEPLOY_CLONE_STORAGE:-}"        # storage for new rootfs (blank = template's)
 
 # Per-CT preserve manifests: extra base-system paths to carry across a redeploy.
@@ -220,7 +221,8 @@ EOF
 
   echo "[3] vzdump backup (rollback point)..."
   local bkout
-  bkout=$(vzdump "$ctid" --mode stop --compress zstd --storage "$REDEPLOY_BACKUP_STORAGE" 2>&1) \
+  bkout=$(vzdump "$ctid" --mode stop --compress zstd --storage "$REDEPLOY_BACKUP_STORAGE" \
+            --prune-backups "keep-last=${REDEPLOY_BACKUP_KEEP}" 2>&1) \
     || { echo "$bkout" >&2; echo "vzdump failed — nothing destroyed." >&2; return 1; }
   backup_file=$(sed -n "s/.*creating vzdump archive '\([^']*\)'.*/\1/p" <<<"$bkout" | tail -1)
   echo "      backup: ${backup_file:-<see vzdump output above>}"
@@ -302,7 +304,7 @@ rollback_lxc() {
 
   if [[ -z "$file" ]]; then
     file=$(pvesm list "$REDEPLOY_BACKUP_STORAGE" --content backup --vmid "$ctid" 2>/dev/null \
-      | awk 'NR>1 {print $1}' | tail -1)
+      | awk 'NR>1 {print $1}' | sort | tail -1)
     [[ -n "$file" ]] || { echo "No backup found for CT ${ctid} on ${REDEPLOY_BACKUP_STORAGE}." >&2; return 1; }
     echo "Using latest backup: ${file}"
   fi
@@ -312,4 +314,14 @@ rollback_lxc() {
   pct restore "$ctid" "$file" --force \
     || { echo "restore failed" >&2; return 1; }
   echo "✔ CT ${ctid} restored (stopped). Start with: pct start ${ctid}"
+}
+
+# List the vzdump backups held for a CT on the backup storage (oldest first).
+# Usage: list_backups <CTID-or-name>
+list_backups() {
+  local ctid; ctid=$(_resolve_ctid "${1:-}") || return 2
+  echo "Backups for CT ${ctid} on ${REDEPLOY_BACKUP_STORAGE} (keep-last=${REDEPLOY_BACKUP_KEEP}):"
+  pvesm list "$REDEPLOY_BACKUP_STORAGE" --content backup --vmid "$ctid" 2>/dev/null \
+    | awk 'NR==1 || $0 ~ /vzdump/' \
+    | sort -k1
 }

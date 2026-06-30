@@ -71,15 +71,40 @@ What's preserved (read off the old config):
 What's NOT carried: docker images and named volumes (images re-pulled on
 `compose up`; the pattern keeps real data in bind mounts under `/opt`).
 
+### Preserving base-system changes
+
+Things outside `/opt` — a `Caddyfile`, `/etc/crontab`, a custom systemd unit —
+are reset to the template's version on redeploy unless you list them in a
+**preserve manifest**: `/etc/pve/redeploy/<ctid>.preserve`, one absolute path
+per line (`#` comments allowed). redeploy tars those paths off the old CT,
+restores them into the clone, then reboots so systemd/caddy/cron pick them up.
+
+`ct_changed_files <ct>` helps you build it — it shows everything that has
+drifted from a stock Debian + template:
+
+- modified package files via `dpkg -V` (conffiles like `Caddyfile`, `/etc/crontab`);
+- unpackaged files in config dirs (custom units, `cron.d`, `/usr/local` scripts, user crontabs).
+
+```bash
+ct_changed_files 118                       # see what drifted
+$EDITOR /etc/pve/redeploy/118.preserve     # list the paths worth keeping
+```
+
+> Tip: the cleanest fix is to *eliminate* the manifest — fold reverse proxies
+> into each stack's `docker-compose.yml` (a caddy service per project) so almost
+> nothing lives on the base system. The manifest is the escape hatch for the rest.
+
 | Function | What it does |
 | --- | --- |
-| `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. |
+| `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over, including preserved paths). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. |
 | `rollback_lxc <ct> [backup]` | Restore from the vzdump taken during redeploy. With no file, uses the latest backup for that CTID. Leaves the CT stopped. |
+| `ct_changed_files <ct>` | Show base-system drift (modified package files + unpackaged config files) to help build the preserve manifest. |
 
-Flow (on `--apply`): stop docker → tar `/opt` → **vzdump backup** → destroy →
-`pct clone --full` template into the same CTID → stamp saved config back on →
-start → restore `/opt` → `compose_up_all`. Aborts on any failed step with the
-exact `rollback_lxc` command to recover.
+Flow (on `--apply`): stop docker → tar `/opt` (+ preserve manifest) → **vzdump
+backup** → destroy → `pct clone --full` template into the same CTID → stamp
+saved config back on → start → restore `/opt` (+ preserved paths, then reboot)
+→ `compose_up_all`. Aborts on any failed step with the exact `rollback_lxc`
+command to recover.
 
 ```bash
 redeploy_lxc 118              # preview what would happen
@@ -90,7 +115,7 @@ rollback_lxc 118             # undo: restore the pre-redeploy backup
 
 Config (env vars): `REDEPLOY_TEMPLATE` (default 999), `REDEPLOY_BACKUP_STORAGE`
 (default `local`, needs "backup" content), `REDEPLOY_CLONE_STORAGE` (blank =
-template's storage).
+template's storage), `REDEPLOY_PRESERVE_DIR` (default `/etc/pve/redeploy`).
 
 ### convert_to_standard
 

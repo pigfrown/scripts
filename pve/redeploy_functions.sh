@@ -29,9 +29,58 @@ REDEPLOY_TEMPLATE="${REDEPLOY_TEMPLATE:-999}"               # template CTID to c
 REDEPLOY_BACKUP_STORAGE="${REDEPLOY_BACKUP_STORAGE:-local}" # vzdump target (needs "backup" content)
 REDEPLOY_CLONE_STORAGE="${REDEPLOY_CLONE_STORAGE:-}"        # storage for new rootfs (blank = template's)
 
+# Per-CT preserve manifests: extra base-system paths to carry across a redeploy.
+# One absolute path per line (files or dirs); # comments and blank lines ignored.
+# On /etc/pve so it is cluster-synced and survives the container's destroy.
+REDEPLOY_PRESERVE_DIR="${REDEPLOY_PRESERVE_DIR:-/etc/pve/redeploy}"
+
 # Print the main section (everything before the first [snapshot]) of a CT config.
 _conf_main() {
   awk '/^\[/{exit} {print}' "/etc/pve/lxc/$1.conf" 2>/dev/null
+}
+
+# Print the preserve-manifest paths for a CT (comments/blank stripped).
+_redeploy_preserve_paths() {
+  local mf="${REDEPLOY_PRESERVE_DIR}/${1}.preserve" line
+  [[ -f "$mf" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    read -r line <<<"$line"   # trim surrounding whitespace
+    [[ -z "$line" ]] && continue
+    printf '%s\n' "$line"
+  done < "$mf"
+}
+
+# Wait until a container responds to exec (after start/reboot).
+_ct_wait_ready() {
+  local ctid="$1" tries="${2:-30}" n=0
+  while (( n < tries )); do
+    pct exec "$ctid" -- true </dev/null 2>/dev/null && return 0
+    sleep 2; ((n++))
+  done
+  return 1
+}
+
+# Show base-system drift vs a stock Debian + template, to help build a preserve
+# manifest: modified package files (incl. conffiles like Caddyfile, /etc/crontab)
+# and unpackaged files in config dirs (custom systemd units, cron.d, scripts).
+# Usage: ct_changed_files <CTID-or-name>
+ct_changed_files() {
+  local ctid
+  ctid=$(_resolve_ctid "${1:-}") || return 2
+
+  echo "=== CT ${ctid}: modified package files (dpkg -V) ==="
+  echo "    cols: '5'=checksum differs, 'c'=conffile"
+  pct exec "$ctid" -- dpkg -V </dev/null 2>/dev/null || true
+  echo
+  echo "=== CT ${ctid}: unpackaged files in config dirs ==="
+  pct exec "$ctid" -- bash -c '
+    comm -23 \
+      <(find /etc /usr/local /root /var/spool/cron -type f 2>/dev/null | sort -u) \
+      <(sort -u /var/lib/dpkg/info/*.list 2>/dev/null)
+  ' </dev/null
+  echo
+  echo "Add the paths you want kept to: ${REDEPLOY_PRESERVE_DIR}/${ctid}.preserve"
 }
 
 # Redeploy a container from a template.
@@ -107,6 +156,8 @@ redeploy_lxc() {
   mapfile -t net_lines   < <(grep -E '^net[0-9]+:' <<<"$old")
   mapfile -t idmap_lines < <(grep -E '^lxc\.idmap:' <<<"$old")
   mapfile -t lxc_lines   < <(grep -E '^lxc\.' <<<"$old")
+  local preserve_paths
+  mapfile -t preserve_paths < <(_redeploy_preserve_paths "$ctid")
 
   local mode="DRY-RUN"; (( apply )) && mode="APPLY"
   cat <<EOF
@@ -122,6 +173,12 @@ EOF
   printf '  net      : %s\n' "${net_lines[@]:-(template)}"
   if (( ${#bind_mps[@]} )); then printf '  bind mp  : %s\n' "${bind_mps[@]//|/ }"; else echo "  bind mp  : (none)"; fi
   if (( ${#idmap_lines[@]} )); then printf '  idmap    : %s\n' "${idmap_lines[@]}"; else echo "  idmap    : (none)"; fi
+  if (( ${#preserve_paths[@]} )); then
+    echo "  preserve : ${REDEPLOY_PRESERVE_DIR}/${ctid}.preserve"
+    printf '             %s\n' "${preserve_paths[@]}"
+  else
+    echo "  preserve : (none — no ${REDEPLOY_PRESERVE_DIR}/${ctid}.preserve)"
+  fi
   echo "  /opt     : tar from old rootfs -> restore into new clone"
   echo "  backup   : vzdump -> ${REDEPLOY_BACKUP_STORAGE} (rollback point)"
   echo
@@ -131,20 +188,37 @@ EOF
     return 0
   fi
 
-  local ts work optfile backup_file
+  local ts work optfile preservefile backup_file
   ts=$(date +%Y%m%d-%H%M%S)
   work="/root/redeploy-${ctid}-${ts}"
   optfile="${work}/opt.tgz"
+  preservefile="${work}/preserve.tgz"
   mkdir -p "$work"
 
-  echo "[1/9] Stopping docker in CT ${ctid}..."
+  echo "[1] Stopping docker in CT ${ctid}..."
   pct exec "$ctid" -- bash -c 'systemctl stop docker docker.socket 2>/dev/null || true' </dev/null
 
-  echo "[2/9] Archiving /opt -> ${optfile}..."
+  echo "[2] Archiving /opt -> ${optfile}..."
   pct exec "$ctid" -- tar czf - -C / opt </dev/null > "$optfile" \
     || { echo "tar /opt failed" >&2; return 1; }
 
-  echo "[3/9] vzdump backup (rollback point)..."
+  if (( ${#preserve_paths[@]} )); then
+    echo "[2b] Archiving preserved base-system paths..."
+    local p keep=()
+    for p in "${preserve_paths[@]}"; do
+      if pct exec "$ctid" -- test -e "$p" </dev/null 2>/dev/null; then
+        keep+=("${p#/}")
+      else
+        echo "      skip (missing): $p"
+      fi
+    done
+    if (( ${#keep[@]} )); then
+      pct exec "$ctid" -- tar czf - -C / "${keep[@]}" </dev/null > "$preservefile" \
+        || { echo "preserve tar failed" >&2; return 1; }
+    fi
+  fi
+
+  echo "[3] vzdump backup (rollback point)..."
   local bkout
   bkout=$(vzdump "$ctid" --mode stop --compress zstd --storage "$REDEPLOY_BACKUP_STORAGE" 2>&1) \
     || { echo "$bkout" >&2; echo "vzdump failed — nothing destroyed." >&2; return 1; }
@@ -152,17 +226,17 @@ EOF
   echo "      backup: ${backup_file:-<see vzdump output above>}"
   pct status "$ctid" | grep -q stopped || pct stop "$ctid" || true
 
-  echo "[4/9] Destroying old CT ${ctid}..."
+  echo "[4] Destroying old CT ${ctid}..."
   pct destroy "$ctid" || { echo "destroy failed" >&2; return 1; }
 
-  echo "[5/9] Cloning template ${template} -> CT ${ctid}..."
+  echo "[5] Cloning template ${template} -> CT ${ctid}..."
   local clone_args=(clone "$template" "$ctid" --full)
   [[ -n "$hostname" ]]                 && clone_args+=(--hostname "$hostname")
   [[ -n "$REDEPLOY_CLONE_STORAGE" ]]   && clone_args+=(--storage "$REDEPLOY_CLONE_STORAGE")
   pct "${clone_args[@]}" \
     || { echo "clone failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 
-  echo "[6/9] Applying saved configuration..."
+  echo "[6] Applying saved configuration..."
   local set_args=(set "$ctid") i=0
   [[ -n "$hostname" ]] && set_args+=(--hostname "$hostname")
   [[ -n "$cores" ]]    && set_args+=(--cores "$cores")
@@ -185,16 +259,26 @@ EOF
     grep -qxF "$l" "$newconf" || printf '%s\n' "$l" >> "$newconf"
   done
 
-  echo "[7/9] Starting CT ${ctid}..."
+  echo "[7] Starting CT ${ctid}..."
   pct start "$ctid" \
     || { echo "start failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
-  sleep 5
+  _ct_wait_ready "$ctid" || { echo "CT ${ctid} did not come up — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 
-  echo "[8/9] Restoring /opt..."
+  echo "[8] Restoring /opt..."
   pct exec "$ctid" -- tar xzf - -C / < "$optfile" \
     || { echo "restore /opt failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 
-  echo "[9/9] Bringing docker stacks up..."
+  if [[ -s "$preservefile" ]]; then
+    echo "[8b] Restoring preserved base-system paths..."
+    pct exec "$ctid" -- tar xzf - -C / < "$preservefile" \
+      || { echo "restore preserve failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
+    echo "[8c] Reloading systemd + rebooting to activate restored services..."
+    pct exec "$ctid" -- systemctl daemon-reload </dev/null 2>/dev/null || true
+    pct reboot "$ctid" 2>/dev/null || { pct stop "$ctid"; pct start "$ctid"; }
+    _ct_wait_ready "$ctid" || echo "  (warning: CT slow to return after reboot)"
+  fi
+
+  echo "[9] Bringing docker stacks up..."
   pct exec "$ctid" -- bash -c 'systemctl start docker 2>/dev/null || true' </dev/null
   type -t compose_up_all >/dev/null && compose_up_all "$ctid" || true
 
@@ -202,6 +286,7 @@ EOF
   echo "✔ CT ${ctid} redeployed from template ${template}."
   echo "  Rollback:     rollback_lxc ${ctid} ${backup_file}"
   echo "  /opt archive: ${optfile}"
+  [[ -s "$preservefile" ]] && echo "  preserve archive: ${preservefile}"
 }
 
 # Restore a CT from a vzdump backup (the redeploy rollback point).

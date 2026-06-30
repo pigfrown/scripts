@@ -320,8 +320,9 @@ convert_to_standard() {
   local keep_arr
   IFS=', ' read -r -a keep_arr <<< "${keep_override:-$DOCKER_STANDARD_KEEP_BINDS}"
 
-  local ctid
+  local ctid ct_hostname
   ctid=$(_resolve_ctid "${args[0]:-}") || return 2
+  ct_hostname=$(pct config "$ctid" | awk '/^hostname:/{print $2}')
 
   if _ct_is_protected "$ctid"; then
     echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — refusing to convert."
@@ -389,7 +390,7 @@ convert_to_standard() {
       continue
     fi
 
-    name=${name_override:-$proj}
+    name=${name_override:-${ct_hostname:-$proj}}
     target="/opt/${name}"
     target_compose="${target}/docker-compose.yml"
 

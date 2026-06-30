@@ -303,11 +303,71 @@ EOF
     echo "  note: template has no docker — skipped compose."
   fi
 
+  local tmpl_ver
+  tmpl_ver=$(_tmpl_get_ver "$template")
+  if (( tmpl_ver > 0 )); then
+    _ct_replace_tag_prefix "$ctid" "from-" "from-${template}-v${tmpl_ver}"
+  fi
+
   echo
   echo "✔ CT ${ctid} redeployed from template ${template}."
+  (( tmpl_ver > 0 )) && echo "  template tag: from-${template}-v${tmpl_ver}"
   echo "  Rollback:     rollback_lxc ${ctid} ${backup_file}"
   echo "  /opt archive: ${optfile}"
   [[ -s "$preservefile" ]] && echo "  preserve archive: ${preservefile}"
+}
+
+# Show deployment status for tracked containers vs. their template's current version.
+# Containers without a from-* tag are listed as untracked.
+# Usage: lxc_template_status [CTID-or-name ...]
+lxc_template_status() {
+  local targets=("$@")
+
+  if (( ${#targets[@]} == 0 )); then
+    local ctid tags
+    while IFS= read -r ctid; do
+      tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+      printf '%s' "$tags" | tr ';' '\n' | grep -q '^from-' && targets+=("$ctid")
+    done < <(pct list 2>/dev/null | awk 'NR>1 {print $1}')
+  fi
+
+  if (( ${#targets[@]} == 0 )); then
+    echo "No containers with deployment tracking tags found."
+    return 0
+  fi
+
+  printf '%-8s %-28s %-12s %-14s %s\n' "CTID" "NAME" "DEPLOYED" "TEMPLATE" "STATUS"
+  printf '%-8s %-28s %-12s %-14s %s\n' "----" "----" "--------" "--------" "------"
+
+  local target
+  for target in "${targets[@]}"; do
+    ctid=$(_resolve_ctid "$target") || continue
+
+    local name from_tag tmpl_ctid deployed_ver tmpl_ver status
+    name=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^hostname:/{print $2}')
+    tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+    from_tag=$(printf '%s' "$tags" | tr ';' '\n' | grep '^from-' | tail -1)
+
+    if [[ -z "$from_tag" ]]; then
+      printf '%-8s %-28s %-12s %-14s %s\n' "$ctid" "${name:--}" "-" "-" "untracked"
+      continue
+    fi
+
+    tmpl_ctid=$(sed 's/^from-\([0-9]*\)-v[0-9]*/\1/' <<<"$from_tag")
+    deployed_ver=$(sed 's/^from-[0-9]*-v\([0-9]*\)/\1/' <<<"$from_tag")
+    tmpl_ver=$(_tmpl_get_ver "$tmpl_ctid")
+
+    if (( tmpl_ver == 0 )); then
+      status="template unversioned"
+    elif (( deployed_ver == tmpl_ver )); then
+      status="current"
+    else
+      status="STALE (v${deployed_ver} → v${tmpl_ver})"
+    fi
+
+    printf '%-8s %-28s %-12s %-14s %s\n' \
+      "$ctid" "${name:--}" "v${deployed_ver}" "${tmpl_ctid}@v${tmpl_ver}" "$status"
+  done
 }
 
 # Restore a CT from a vzdump backup (the redeploy rollback point).

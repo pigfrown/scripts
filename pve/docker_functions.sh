@@ -37,28 +37,9 @@ DOCKER_STANDARD_TAG="${DOCKER_STANDARD_TAG:-docker-standardised}"
 # copy/tar its contents (mounted read-only). Any tiny image with cp+tar works.
 DOCKER_MIGRATE_IMAGE="${DOCKER_MIGRATE_IMAGE:-alpine}"
 
-# True if the container's config carries the given tag.
-# Usage: _ct_has_tag <CTID> <tag>
-_ct_has_tag() {
-  local tags
-  tags=$(pct config "$1" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
-  [[ ";${tags};" == *";${2};"* ]]
-}
-
 # True if the container carries the protect (denylist) tag.
 # Usage: _ct_is_protected <CTID>
 _ct_is_protected() { _ct_has_tag "$1" "$DOCKER_PROTECT_TAG"; }
-
-# Add a tag to a container, preserving its existing tags. No-op if already set.
-# (pct set --tags REPLACES the whole list, so we read, append, and write back.)
-# Usage: _ct_add_tag <CTID> <tag>
-_ct_add_tag() {
-  local ctid="$1" tag="$2" tags
-  _ct_has_tag "$ctid" "$tag" && return 0
-  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
-  [[ -n "$tags" ]] && tags="${tags};${tag}" || tags="$tag"
-  pct set "$ctid" --tags "$tags"
-}
 
 # True if the container has docker installed and the daemon is running.
 # Usage: ct_has_docker <CTID-or-name>

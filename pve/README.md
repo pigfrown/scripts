@@ -16,7 +16,7 @@ All functions accept a **CTID or a container name** (resolved via `pct list`).
 | Function | What it does |
 | --- | --- |
 | `update_debian <ct>` | `apt update && upgrade -y && autoremove -y` inside the container. |
-| `update_template [ct]` | Update a template (default CTID 999): clears the `template:` flag, starts, updates, stops, re-sets the flag. Toggles the flag in `/etc/pve/lxc/<id>.conf` — it does **not** run `pct template` (the disk is already a basevol). Root + host only. |
+| `update_template [ct]` | Update a template (default CTID 999): clears the `template:` flag, starts, runs `apt upgrade`, then **pauses** so you can `pct exec` in and make manual changes. Press Y to finalise (re-flags as template, bumps `tmplver-N` tag) or N to abort without bumping the version. Root + host only. |
 | `backup_lxc <ct> [--storage S] [--keep N] [--mode M] [--compress C]` | Full `vzdump` of the CT (config + PVE-managed volumes), pruned to the last N per CT. Prints the archive path on stdout (progress on stderr). The single backup helper every script uses. Root + host only. |
 
 ### backups: `backup_lxc`
@@ -122,6 +122,27 @@ What's preserved (read off the old config):
 What's NOT carried: docker images and named volumes (images re-pulled on
 `compose up`; the pattern keeps real data in bind mounts under `/opt`).
 
+### Template version tracking
+
+Template versions are tracked via PVE tags — visible in the UI on both the template and its deployed containers.
+
+**On the template:** `tmplver-N` (e.g. `tmplver-3`). `update_template` bumps this automatically when you finalise. If you need to bump it manually (e.g. after editing the template directly): `_ct_replace_tag_prefix <tmpl> tmplver- tmplver-N`.
+
+**On each deployed container:** `from-<tmplCTID>-v<N>` (e.g. `from-999-v3`). Stamped automatically by `redeploy_lxc --apply`. Containers deployed before this feature was added show as **untracked** until their next redeploy.
+
+```bash
+lxc_template_status          # show all tracked containers
+lxc_template_status 101 103  # check specific CTs
+```
+
+```
+CTID     NAME                         DEPLOYED     TEMPLATE       STATUS
+----     ----                         --------     --------       ------
+101      nginx                        v3           999@v3         current
+103      gitea                        v2           999@v3         STALE (v2 → v3)
+107      plex                         -            -              untracked
+```
+
 ### Preserving base-system changes
 
 Things outside `/opt` — a `Caddyfile`, `/etc/crontab`, a custom systemd unit —
@@ -147,7 +168,8 @@ $EDITOR /etc/pve/redeploy/118.preserve     # list the paths worth keeping
 
 | Function | What it does |
 | --- | --- |
-| `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over, including preserved paths). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. |
+| `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over, including preserved paths). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. Stamps a `from-<tmplCTID>-v<N>` tag on the CT on success. |
+| `lxc_template_status [ct ...]` | Show which containers are current or stale vs. their template version. With no args, scans all CTs with a `from-*` tag. |
 | `rollback_lxc <ct> [backup]` | Restore from the vzdump taken during redeploy. With no file, uses the latest backup for that CTID. Leaves the CT stopped. |
 | `list_backups <ct>` | List the vzdump backups held for a CT on the backup storage. |
 | `ct_changed_files <ct>` | Show base-system drift (modified package files + unpackaged config files) to help build the preserve manifest. |

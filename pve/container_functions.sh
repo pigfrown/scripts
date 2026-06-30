@@ -112,6 +112,21 @@ update_template() {
     return 1
   fi
 
+  echo
+  echo "  CT ${ctid} is running. Exec in to make additional changes:"
+  echo "    pct exec ${ctid} -- bash"
+  echo
+  local reply
+  read -r -p "  Finalise? [Y/n] " reply
+  case "${reply,,}" in
+    n|no)
+      echo "Aborted — stopping CT ${ctid} and restoring template flag (version not bumped)." >&2
+      pct stop "$ctid" || true
+      [[ $was_template -eq 1 ]] && _set_template_flag "$conf"
+      return 1
+      ;;
+  esac
+
   echo "Stopping CT ${ctid}..."
   pct stop "$ctid"
 
@@ -119,6 +134,7 @@ update_template() {
   if [[ $was_template -eq 1 ]]; then
     echo "Recreating template from CT ${ctid}..."
     _set_template_flag "$conf"
+    _tmpl_bump_ver "$ctid"
     echo "✔ Template CT ${ctid} updated and re-created."
   else
     echo "✔ CT ${ctid} updated (left as a normal container)."
@@ -129,6 +145,73 @@ update_template() {
 _set_template_flag() {
   local conf="$1"
   grep -q '^template: 1$' "$conf" || sed -i '1i template: 1' "$conf"
+}
+
+# ── Container tag helpers ──────────────────────────────────────────────────────
+
+# True if the container's config carries the given tag.
+_ct_has_tag() {
+  local tags
+  tags=$(pct config "$1" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  [[ ";${tags};" == *";${2};"* ]]
+}
+
+# Add a tag to a container, preserving existing tags. No-op if already set.
+# (pct set --tags REPLACES the whole list, so we read, append, and write back.)
+_ct_add_tag() {
+  local ctid="$1" tag="$2" tags
+  _ct_has_tag "$ctid" "$tag" && return 0
+  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  [[ -n "$tags" ]] && tags="${tags};${tag}" || tags="$tag"
+  pct set "$ctid" --tags "$tags"
+}
+
+# Remove a specific tag from a container. No-op if not present.
+_ct_remove_tag() {
+  local ctid="$1" tag="$2" tags new_tags
+  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  new_tags=$(printf '%s' "$tags" | tr ';' '\n' | grep -xvF "$tag" | grep -v '^$' \
+               | tr '\n' ';' | sed 's/;$//')
+  [[ "$tags" == "$new_tags" ]] && return 0
+  pct set "$ctid" --tags "$new_tags"
+}
+
+# Remove all tags with the given prefix, then stamp new_tag in their place.
+# Used to replace versioned tags like tmplver-1 → tmplver-2.
+_ct_replace_tag_prefix() {
+  local ctid="$1" prefix="$2" new_tag="$3" tags new_tags
+  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  new_tags=$(printf '%s' "$tags" | tr ';' '\n' | grep -v "^${prefix}" | grep -v '^$' \
+               | tr '\n' ';' | sed 's/;$//')
+  [[ -n "$new_tags" ]] && new_tags="${new_tags};${new_tag}" || new_tags="$new_tag"
+  pct set "$ctid" --tags "$new_tags"
+}
+
+# ── Template version helpers ───────────────────────────────────────────────────
+#
+# Template version is tracked via a PVE tag on the template CT itself:
+#   tmplver-N   (e.g. tmplver-1, tmplver-2)
+#
+# Containers deployed by redeploy_lxc get a corresponding tag:
+#   from-<tmplCTID>-v<N>   (e.g. from-118-v2)
+#
+# Use lxc_template_status to see which containers are current or stale.
+
+# Print the current version number of a template CT (0 if unversioned).
+_tmpl_get_ver() {
+  local tags ver
+  tags=$(pct config "$1" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  ver=$(printf '%s' "$tags" | tr ';' '\n' | sed -n 's/^tmplver-//p' | tail -1)
+  echo "${ver:-0}"
+}
+
+# Increment the tmplver-N tag on a template CT (creates v1 if unversioned).
+_tmpl_bump_ver() {
+  local ctid="$1" cur next
+  cur=$(_tmpl_get_ver "$ctid")
+  next=$(( cur + 1 ))
+  _ct_replace_tag_prefix "$ctid" "tmplver-" "tmplver-${next}"
+  echo "  template version: v${cur} → v${next}"
 }
 
 # Take a full vzdump backup of a container — its config + every PVE-managed

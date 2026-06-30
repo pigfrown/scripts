@@ -479,7 +479,7 @@ convert_to_standard() {
           kept=0
           for k in "${keep_arr[@]}"; do [[ -n "$k" && "$top" == "$k" ]] && { kept=1; break; }; done
           if [[ $kept -eq 1 ]]; then
-            moves+=("$bsrc|${target}/${rel}")
+            moves+=("$bsrc|${target}/${rel}|${bdst}")
             echo "  config bind : ${bsrc}  (kept with project)"
           else
             volmoves+=("${bsrc}|/opt/volumes/${name}_${rel}|${bdst}")
@@ -517,9 +517,10 @@ convert_to_standard() {
 
     # Pre-flight: long-form YAML volume/bind syntax cannot be rewritten by the sed
     # patterns below — catch it before touching the running stack.
-    if [[ ${#volmoves[@]} -gt 0 ]]; then
-      local lf_srcs=() lf_hits
-      for m in "${volmoves[@]}"; do lf_srcs+=("${m%%|*}"); done
+    local lf_srcs=() lf_hits
+    for m in "${volmoves[@]}"; do lf_srcs+=("${m%%|*}"); done
+    for m in "${moves[@]}"; do lf_srcs+=("${m%%|*}"); done
+    if [[ ${#lf_srcs[@]} -gt 0 ]]; then
       lf_hits=$(_compose_longform_sources "$ctid" "$cf" "${lf_srcs[@]}")
       if [[ -n "$lf_hits" ]]; then
         echo "  ! ${cf} uses long-form YAML volume syntax for source(s) that need rewriting:"
@@ -541,14 +542,25 @@ convert_to_standard() {
     if [[ $needs_move -eq 1 ]]; then
       _ct_step "$ctid" "$apply" "create ${target}" "mkdir -p '${target}'" || return 1
       for m in "${moves[@]}"; do
-        src=${m%%|*}
-        dst=${m##*|}
+        IFS='|' read -r src dst bdst <<< "$m"
         _ct_step "$ctid" "$apply" "move ${src} -> ${dst}" \
           "mkdir -p '$(dirname "$dst")' && mv '${src}' '${dst}'" || return 1
       done
       _ct_step "$ctid" "$apply" "move compose -> ${target_compose}" \
         "mv '${cf}' '${target_compose}'" || return 1
       cf_now="$target_compose"; wd_now="$target"
+      # Rewrite config-bind sources in the (now-moved) compose file. Relative refs
+      # like ./config would still resolve correctly after the move, but absolute refs
+      # (e.g. /opt/config) point at the old location which no longer exists.
+      # Anchoring on the container destination is source-format-agnostic.
+      for m in "${moves[@]}"; do
+        IFS='|' read -r src dst bdst <<< "$m"
+        esc_dest=$(_sed_escape_re "$bdst")
+        repl=$(_sed_escape_repl "$dst")
+        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)[^:[:space:]]+(:'"${esc_dest}"'/?(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\2#'
+        _ct_step "$ctid" "$apply" "rewrite compose config source -> ${dst}" \
+          "sed -i -E '${sed_expr}' '${cf_now}'" || return 1
+      done
     fi
 
     # Centralise volume binds under the shared /opt/volumes and repoint the

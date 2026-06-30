@@ -132,8 +132,13 @@ CT are kept and old ones are pruned — they won't silently fill the disk.
 ```bash
 list_backups 118             # what's held for CT 118
 rollback_lxc 118             # restore the newest (then: pct start 118)
-rollback_lxc 118 local:backup/vzdump-lxc-118-2026_06_30-10_00_00.tar.zst   # a specific one
+rollback_lxc 118 /var/lib/vz/dump/vzdump-lxc-118-2026_06_30-10_00_00.tar.zst   # a specific one
+rollback_lxc 118 <file> --storage=local-lvm   # force the rootfs storage
 ```
+
+`rollback_lxc` restores the rootfs to the CT's current rootfs storage (detected
+from its config); if the CT no longer exists, pass `--storage=<id>`. It does
+**not** default to `local` — `local` can't hold a container rootfs.
 
 Flow (on `--apply`): stop docker → tar `/opt` (+ preserve manifest) → **vzdump
 backup** → destroy → `pct clone --full` template into the same CTID → stamp

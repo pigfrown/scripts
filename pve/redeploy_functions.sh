@@ -40,6 +40,11 @@ _conf_main() {
   awk '/^\[/{exit} {print}' "/etc/pve/lxc/$1.conf" 2>/dev/null
 }
 
+# Storage id of a CT's rootfs (e.g. "local-lvm" from "rootfs: local-lvm:vm-...").
+_ct_rootfs_storage() {
+  sed -n 's/^rootfs: \([^:]*\):.*/\1/p' "/etc/pve/lxc/$1.conf" 2>/dev/null | head -1
+}
+
 # Print the preserve-manifest paths for a CT (comments/blank stripped).
 _redeploy_preserve_paths() {
   local mf="${REDEPLOY_PRESERVE_DIR}/${1}.preserve" line
@@ -280,9 +285,14 @@ EOF
     _ct_wait_ready "$ctid" || echo "  (warning: CT slow to return after reboot)"
   fi
 
-  echo "[9] Bringing docker stacks up..."
-  pct exec "$ctid" -- bash -c 'systemctl start docker 2>/dev/null || true' </dev/null
-  type -t compose_up_all >/dev/null && compose_up_all "$ctid" || true
+  echo "[9] Enabling docker + bringing stacks up..."
+  if pct exec "$ctid" -- bash -c 'command -v docker >/dev/null 2>&1' </dev/null; then
+    pct exec "$ctid" -- systemctl enable --now docker </dev/null \
+      || echo "  warning: docker did not start — check 'systemctl status docker' in CT ${ctid}"
+    type -t compose_up_all >/dev/null && compose_up_all "$ctid" || true
+  else
+    echo "  note: template has no docker — skipped compose."
+  fi
 
   echo
   echo "✔ CT ${ctid} redeployed from template ${template}."
@@ -299,8 +309,17 @@ rollback_lxc() {
     echo "Run as root on the Proxmox host" >&2
     return 1
   fi
-  local ctid; ctid=$(_resolve_ctid "${1:-}") || return 2
-  local file="${2:-}"
+
+  local storage="" pos=() a
+  for a in "$@"; do
+    case "$a" in
+      --storage=*) storage="${a#*=}" ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+
+  local ctid; ctid=$(_resolve_ctid "${pos[0]:-}") || return 2
+  local file="${pos[1]:-}"
 
   if [[ -z "$file" ]]; then
     file=$(pvesm list "$REDEPLOY_BACKUP_STORAGE" --content backup --vmid "$ctid" 2>/dev/null \
@@ -309,9 +328,20 @@ rollback_lxc() {
     echo "Using latest backup: ${file}"
   fi
 
+  # pct restore needs an explicit rootfs storage (it falls back to 'local',
+  # which can't hold a container rootfs). Detect from the current CT, or override.
+  if [[ -z "$storage" ]]; then
+    storage=$(_ct_rootfs_storage "$ctid")
+    storage="${storage:-$REDEPLOY_CLONE_STORAGE}"
+  fi
+  if [[ -z "$storage" ]]; then
+    echo "Cannot determine rootfs storage — pass one: rollback_lxc ${ctid} <file> --storage=<storage>" >&2
+    return 1
+  fi
+
   pct stop "$ctid" 2>/dev/null || true
-  echo "Restoring CT ${ctid} from ${file}..."
-  pct restore "$ctid" "$file" --force \
+  echo "Restoring CT ${ctid} from ${file} (rootfs -> ${storage})..."
+  pct restore "$ctid" "$file" --force --storage "$storage" \
     || { echo "restore failed" >&2; return 1; }
   echo "✔ CT ${ctid} restored (stopped). Start with: pct start ${ctid}"
 }

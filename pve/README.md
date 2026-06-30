@@ -67,6 +67,10 @@ Notes:
 | `convert_to_standard <ct> [--apply]` | Migrate each project to `/opt/<project>/`. **Dry-run by default**; refuses protected containers. | 0/1/2 |
 | `convert_all_docker [--apply]` | Run the converter across every eligible container (docker + not protected). **Dry-run by default**. | — |
 | `compose_up_all <ct>` | `docker compose up -d` for every `/opt/<app>/docker-compose.yml`. | 0/2 |
+| `check_volumes <ct>` | Report docker **volume** mounts (named/anonymous) on running containers — data that would NOT survive a redeploy. | 0 none / 1 volumes / 2 n/a |
+| `check_all_volumes` | Run `check_volumes` across every eligible container (skips protected). | — |
+| `migrate_volumes_to_binds <ct> [--apply] [--force]` | Copy each **named** volume's data into a project-local bind mount (`<workdir>/volumes/<name>`), rewrite the compose file, restart, and verify — so `convert_to_standard` can then run. **Dry-run by default.** | 0/1/2 |
+| `migrate_all_volumes [--apply] [--force]` | Run the migration across every eligible container. **Dry-run by default**. | — |
 
 ## redeploy_functions.sh — cattle-style rebuilds
 
@@ -156,6 +160,55 @@ rollback_lxc 118             # undo: restore the pre-redeploy backup
 Config (env vars): `REDEPLOY_TEMPLATE` (default 999), `REDEPLOY_BACKUP_STORAGE`
 (default `local`, needs "backup" content), `REDEPLOY_CLONE_STORAGE` (blank =
 template's storage), `REDEPLOY_PRESERVE_DIR` (default `/etc/pve/redeploy`).
+
+### Docker volumes → bind mounts (`migrate_volumes_to_binds`)
+
+`convert_to_standard` (and `redeploy_lxc`) only carry data that lives on the
+filesystem under the project tree. Named/anonymous **docker volumes** live in
+docker's own storage, so they'd be left behind — which is why
+`convert_to_standard` **refuses** a container that still has volume mounts and
+points you here.
+
+`migrate_volumes_to_binds` copies each **named** volume into a project-local
+bind mount and rewrites the compose file so the stack uses it instead:
+
+1. Discovers volume mounts from running containers' compose labels.
+2. **Backs up** the compose file and tars each volume to
+   `/root/volume-migration-<ts>/`.
+3. `docker-compose down` — **without `-v`**, so the volumes are *not* deleted.
+4. For each named volume `V` (mounted at `DEST`): copies its contents (mounted
+   **read-only**, `cp -a`) into `<workdir>/volumes/V`, then rewrites the
+   `V:DEST` reference in the compose file to `<workdir>/volumes/V:DEST`.
+5. `docker-compose up -d`, then **verifies**: the stack no longer mounts the
+   migrated volumes, and each bind dir matches its source volume (file count +
+   total bytes). On any failure it prints the exact restore-from-backup command
+   and never removes anything.
+
+The original named volumes are **left in place** as a rollback net — the
+function prints the `docker volume rm` commands to run once you're confident.
+Because they survive, recovery from a bad migration is just: restore the
+backed-up compose file and `up -d`.
+
+> **Anonymous volumes** (image `VOLUME` or a bare `- /path` line) can't be
+> rewritten unambiguously, so they're backed up and **reported but left in
+> place**. If any remain, `convert_to_standard` still refuses until you handle
+> them by hand.
+
+Intended order — **always dry-run first**:
+
+```bash
+check_volumes 118                       # see what's in volumes
+migrate_volumes_to_binds 118            # preview the migration
+migrate_volumes_to_binds 118 --apply    # copy data, rewrite compose, verify
+check_volumes 118                       # confirm: no volumes left
+convert_to_standard 118 --apply         # now it proceeds
+# once happy:
+pct exec 118 -- docker volume rm <name> # remove the old (now-orphaned) volumes
+```
+
+Config: `DOCKER_MIGRATE_IMAGE` (default `alpine`) — the throwaway image used to
+read volumes and copy/tar their contents. Pass `--force` to write into a target
+bind dir that already exists and is non-empty.
 
 ### convert_to_standard
 

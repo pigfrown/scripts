@@ -33,6 +33,10 @@ DOCKER_TAG="${DOCKER_TAG:-docker}"
 DOCKER_PROTECT_TAG="${DOCKER_PROTECT_TAG:-noauto}"
 DOCKER_STANDARD_TAG="${DOCKER_STANDARD_TAG:-docker-standardised}"
 
+# Throwaway image used by migrate_volumes_to_binds to read a docker volume and
+# copy/tar its contents (mounted read-only). Any tiny image with cp+tar works.
+DOCKER_MIGRATE_IMAGE="${DOCKER_MIGRATE_IMAGE:-alpine}"
+
 # True if the container's config carries the given tag.
 # Usage: _ct_has_tag <CTID> <tag>
 _ct_has_tag() {
@@ -260,6 +264,15 @@ _ct_step() {
   fi
 }
 
+# Escape a string for safe use on the *match* side of a sed s### expression
+# (delimiter '#'). Over-escapes: anything not alnum/_/- is backslash-protected.
+# Usage: _sed_escape_re <string>
+_sed_escape_re() { printf '%s' "$1" | sed 's/[^[:alnum:]_-]/\\&/g'; }
+
+# Escape a string for safe use on the *replacement* side of a sed s### (delim
+# '#'): backslash, ampersand and the delimiter itself. Usage: _sed_escape_repl
+_sed_escape_repl() { printf '%s' "$1" | sed 's/[&\\#]/\\&/g'; }
+
 # Convert a container to the standard layout:
 #   /opt/<project>/docker-compose.yml  with project-local bind mounts moved
 #   alongside it. External (shared) bind mounts are reported and left in place.
@@ -314,9 +327,11 @@ convert_to_standard() {
 
   if ! check_volumes "$ctid"; then
     if [[ $force -eq 1 ]]; then
-      echo "CT ${ctid}: volumes present but --force given — proceeding anyway."
+      echo "CT ${ctid}: volumes present but --force given — proceeding anyway (volume data will be LOST)."
     else
-      echo "CT ${ctid}: docker volumes in use (above) — refusing to convert. Pass --force to override."
+      echo "CT ${ctid}: docker volumes in use (above) — refusing to convert."
+      echo "  Migrate them to bind mounts first:  migrate_volumes_to_binds ${ctid} --apply"
+      echo "  (or pass --force to convert anyway and lose the volume data)."
       return 2
     fi
   fi
@@ -436,4 +451,307 @@ convert_to_standard() {
   else
     echo "Dry-run only. Re-run with --apply to perform the changes above."
   fi
+}
+
+# Copy the contents of every named docker *volume* into project-local *bind
+# mounts* under the compose working dir, rewrite the compose file to use those
+# binds, and restart the stack — so the container ends up with no volume mounts
+# and convert_to_standard will proceed (and a later redeploy carries the data
+# in /opt, not in docker storage).
+#
+# This is the deliberate, opt-in step that convert_to_standard points you to;
+# it is NOT run automatically. It only touches data safely:
+#   - `compose down` is run WITHOUT -v, so the named volumes persist;
+#   - data is read from the volume mounted READ-ONLY and copied with `cp -a`;
+#   - every volume is tar'd to a backup first, alongside the compose file;
+#   - after `up`, it VERIFIES the stack no longer mounts the migrated volumes
+#     and that each bind dir matches the source (file count + total bytes);
+#   - the original named volumes are LEFT IN PLACE as a rollback net — the
+#     `docker volume rm` commands are printed for you to run once happy.
+#
+# Each named volume V (mounted at DEST) becomes the bind <workdir>/volumes/V.
+# Anonymous volumes (image VOLUME / bare `- /path`) can't be rewritten safely,
+# so they are backed up and reported but left in place; if any remain,
+# convert_to_standard will still refuse until you handle them by hand.
+#
+# DRY-RUN by default — prints the plan. Pass --apply to make changes. --force
+# allows writing into a target bind dir that already exists and is non-empty.
+# Aborts a project on the first failed step (after --apply) so you can inspect,
+# printing the exact recover-from-backup command; other projects continue.
+#
+# Usage: migrate_volumes_to_binds <CTID-or-name> [--apply] [--force]
+migrate_volumes_to_binds() {
+  local apply=0 force=0 a args=()
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    case "$a" in
+      --apply) apply=1 ;;
+      --force) force=1 ;;
+      *) args+=("$a") ;;
+    esac
+    shift
+  done
+
+  local ctid
+  ctid=$(_resolve_ctid "${args[0]:-}") || return 2
+
+  if _ct_is_protected "$ctid"; then
+    echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — refusing to migrate."
+    return 2
+  fi
+  if ! ct_has_docker "$ctid"; then
+    echo "CT ${ctid}: no docker — not applicable, skipping."
+    return 2
+  fi
+
+  # proj|wd|cf|vname|dest, one line per *volume* mount on a running container
+  # (same label-driven discovery as find_compose / check_volumes).
+  local rows
+  rows=$(pct exec "$ctid" -- bash -c '
+    docker ps --format "{{.ID}}" 2>/dev/null | while read -r id; do
+      proj=$(docker inspect "$id" --format "{{ index .Config.Labels \"com.docker.compose.project\" }}" 2>/dev/null)
+      wd=$(docker inspect "$id" --format "{{ index .Config.Labels \"com.docker.compose.project.working_dir\" }}" 2>/dev/null)
+      cf=$(docker inspect "$id" --format "{{ index .Config.Labels \"com.docker.compose.project.config_files\" }}" 2>/dev/null)
+      docker inspect "$id" --format "{{range .Mounts}}{{if eq .Type \"volume\"}}${proj}|${wd}|${cf}|{{if .Name}}{{.Name}}{{else}}<anon>{{end}}|{{.Destination}}{{\"\n\"}}{{end}}{{end}}" 2>/dev/null
+    done | sort -u
+  ' </dev/null)
+
+  if [[ -z "$rows" ]]; then
+    echo "CT ${ctid}: ✔ no docker volumes in use — nothing to migrate."
+    return 0
+  fi
+
+  local mode="DRY-RUN"; [[ $apply -eq 1 ]] && mode="APPLY"
+  echo "=== migrate_volumes_to_binds CT ${ctid} [${mode}] ==="
+
+  local backup_dir="/root/volume-migration-$(date +%Y%m%d-%H%M%S)"
+  local subdir="volumes"
+  local rc=0
+  local orphans=() anons=()
+
+  # Volumes on non-compose containers carry no project label; we can't place
+  # them under a working dir, so report them and move on.
+  local noproj
+  noproj=$(printf '%s\n' "$rows" | awk -F'|' '$1==""{print $4" -> "$5}' | sort -u)
+
+  local projects proj
+  projects=$(printf '%s\n' "$rows" | awk -F'|' '$1!=""{print $1}' | sort -u)
+
+  while IFS= read -r proj; do
+    [[ -z "$proj" ]] && continue
+
+    local prows wd cf
+    prows=$(printf '%s\n' "$rows" | awk -F'|' -v p="$proj" '$1==p')
+    wd=$(printf '%s\n' "$prows" | head -1 | cut -d'|' -f2)
+    cf=$(printf '%s\n' "$prows" | head -1 | cut -d'|' -f3)
+    cf=${cf%%,*}
+    case "$cf" in /*) : ;; *) cf="${wd%/}/$cf" ;; esac
+
+    echo
+    echo "Project '${proj}':"
+    echo "  compose : ${cf}"
+    echo "  workdir : ${wd}"
+
+    if [[ -z "$wd" || "$wd" == "/" ]]; then
+      echo "  -> suspicious working_dir '${wd}' — SKIPPING."
+      rc=1; continue
+    fi
+
+    # named (migratable) vs anonymous (64-hex / <anon>) — same test as check_volumes
+    local named_pairs named_unique anon_dests
+    named_pairs=$(printf '%s\n' "$prows" | awk -F'|' '
+      { v=$4; if (v=="<anon>" || v ~ /^[0-9a-f]{64}$/) next; print $4"|"$5 }' | sort -u)
+    named_unique=$(printf '%s\n' "$named_pairs" | cut -d'|' -f1 | sed '/^$/d' | sort -u)
+    anon_dests=$(printf '%s\n' "$prows" | awk -F'|' '
+      { v=$4; if (v=="<anon>" || v ~ /^[0-9a-f]{64}$/) print $5 }' | sort -u)
+
+    local vname dest bind
+    while IFS='|' read -r vname dest; do
+      [[ -z "$vname" ]] && continue
+      echo "  named vol: ${vname}  ->  ${wd%/}/${subdir}/${vname}   (mounted at ${dest})"
+    done <<< "$named_pairs"
+    while IFS= read -r dest; do
+      [[ -z "$dest" ]] && continue
+      echo "  anon vol : <anonymous> at ${dest}  — NOT migrated (handle by hand)"
+      anons+=("CT ${ctid} '${proj}': anonymous volume at ${dest}")
+    done <<< "$anon_dests"
+
+    if [[ -z "$named_unique" ]]; then
+      echo "  -> no named volumes to migrate in this project."
+      continue
+    fi
+
+    # --- apply-only pre-flight: don't clobber existing target dirs ---
+    if [[ $apply -eq 1 ]]; then
+      local nonempty=0
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        bind="${wd%/}/${subdir}/${vname}"
+        if pct exec "$ctid" -- bash -c "[ -d '${bind}' ] && [ -n \"\$(ls -A '${bind}' 2>/dev/null)\" ]" </dev/null; then
+          echo "  ! target ${bind} already exists and is non-empty"
+          nonempty=1
+        fi
+      done <<< "$named_unique"
+      if [[ $nonempty -eq 1 ]]; then
+        if [[ $force -eq 1 ]]; then
+          echo "  (--force given — proceeding into non-empty target dir(s))"
+        else
+          echo "  refusing to overwrite existing data — pass --force to override. SKIPPING project."
+          rc=1; continue
+        fi
+      fi
+    fi
+
+    local pfail=0
+
+    # backup: compose file + a tarball per volume
+    _ct_step "$ctid" "$apply" "backup compose -> ${backup_dir}/${proj}/" \
+      "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/'" || pfail=1
+    if [[ $pfail -eq 0 ]]; then
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        _ct_step "$ctid" "$apply" "backup volume ${vname} -> ${backup_dir}/${proj}/vol-${vname}.tgz" \
+          "docker run --rm -v '${vname}:/v:ro' -v '${backup_dir}/${proj}:/b' '${DOCKER_MIGRATE_IMAGE}' tar czf '/b/vol-${vname}.tgz' -C /v ." \
+          || { pfail=1; break; }
+      done <<< "$named_unique"
+    fi
+
+    # stop the stack (volumes preserved — no -v)
+    [[ $pfail -eq 0 ]] && { _ct_step "$ctid" "$apply" "compose down (volumes preserved)" \
+      "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || pfail=1; }
+
+    # copy each volume's contents into its bind dir (read-only source, cp -a)
+    if [[ $pfail -eq 0 ]]; then
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        bind="${wd%/}/${subdir}/${vname}"
+        _ct_step "$ctid" "$apply" "copy volume ${vname} -> ${bind}" \
+          "mkdir -p '${bind}' && docker run --rm -v '${vname}:/from:ro' -v '${bind}:/to' '${DOCKER_MIGRATE_IMAGE}' sh -c 'cp -a /from/. /to/'" \
+          || { pfail=1; break; }
+      done <<< "$named_unique"
+    fi
+
+    # rewrite each volume reference in the compose file to its bind path
+    if [[ $pfail -eq 0 ]]; then
+      while IFS='|' read -r vname dest; do
+        [[ -z "$vname" ]] && continue
+        bind="${wd%/}/${subdir}/${vname}"
+        local esc_name esc_dest repl sed_expr
+        esc_name=$(_sed_escape_re "$vname")
+        esc_dest=$(_sed_escape_re "$dest")
+        repl=$(_sed_escape_repl "$bind")
+        # match a short-form list item `- [<q>]NAME:DEST[:mode][<q>]` anchored on
+        # both NAME and DEST so only the right line changes; keep any quotes/mode.
+        sed_expr='s#^([[:space:]]*-[[:space:]]*[\x22\x27]?)'"${esc_name}"'(:'"${esc_dest}"'(:[a-zA-Z,]+)?[\x22\x27]?[[:space:]]*)$#\1'"${repl}"'\2#'
+        _ct_step "$ctid" "$apply" "rewrite compose: ${vname}:${dest} -> bind" \
+          "sed -i -E '${sed_expr}' '${cf}'" || { pfail=1; break; }
+      done <<< "$named_pairs"
+    fi
+
+    # bring it back up from the same place / project name
+    [[ $pfail -eq 0 ]] && { _ct_step "$ctid" "$apply" "compose up -d" \
+      "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' up -d" || pfail=1; }
+
+    if [[ $apply -eq 1 && $pfail -eq 1 ]]; then
+      echo "  ! a step FAILED. Recover this project with:"
+      echo "      pct exec ${ctid} -- bash -c \"cp '${backup_dir}/${proj}/$(basename "$cf")' '${cf}' && cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' up -d\""
+      echo "    (the original named volume(s) still hold the data.)"
+      rc=1; continue
+    fi
+
+    # ---------- verify (apply only) ----------
+    if [[ $apply -eq 1 ]]; then
+      # (a) no migrated volume is still mounted on the running stack
+      local still leftover=""
+      still=$(pct exec "$ctid" -- bash -c '
+        for id in $(docker ps -q --filter label=com.docker.compose.project='"$proj"'); do
+          docker inspect "$id" --format "{{range .Mounts}}{{if eq .Type \"volume\"}}{{if .Name}}{{.Name}}{{end}}{{\"\n\"}}{{end}}{{end}}" 2>/dev/null
+        done | sort -u
+      ' </dev/null)
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        grep -qxF "$vname" <<< "$still" && leftover+=" ${vname}"
+      done <<< "$named_unique"
+      if [[ -n "$leftover" ]]; then
+        echo "  ! VERIFY FAILED: still mounted as volume(s):${leftover}"
+        echo "    The compose rewrite did not take (unusual syntax / inline comment?)."
+        echo "    Data is safely copied to the bind dir(s) and backed up; the compose"
+        echo "    file is at ${cf} — finish those reference(s) by hand, then re-run up."
+        rc=1; continue
+      fi
+
+      # (b) each bind dir matches its source volume (file count + total bytes)
+      local vfail=0 src dst
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        bind="${wd%/}/${subdir}/${vname}"
+        src=$(pct exec "$ctid" -- bash -c "docker run --rm -v '${vname}:/v:ro' '${DOCKER_MIGRATE_IMAGE}' sh -c 'echo \$(find /v -type f | wc -l):\$(find /v -type f -exec cat {} + 2>/dev/null | wc -c)'" </dev/null)
+        dst=$(pct exec "$ctid" -- bash -c "echo \$(find '${bind}' -type f | wc -l):\$(find '${bind}' -type f -exec cat {} + 2>/dev/null | wc -c)" </dev/null)
+        if [[ "$src" != "$dst" ]]; then
+          echo "  ! VERIFY FAILED: ${vname} source(${src}) != bind(${dst}) [files:bytes]"
+          vfail=1
+        else
+          echo "  ✔ verified ${vname} (${dst} files:bytes)"
+        fi
+      done <<< "$named_unique"
+      if [[ $vfail -eq 1 ]]; then
+        echo "    Bind data differs from the source volume — do NOT remove the volume(s)."
+        rc=1; continue
+      fi
+
+      # success for this project — queue the source volumes for manual cleanup
+      while IFS= read -r vname; do
+        [[ -z "$vname" ]] && continue
+        orphans+=("$vname")
+      done <<< "$named_unique"
+    fi
+
+  done <<< "$projects"
+
+  echo
+  if [[ $apply -eq 1 ]]; then
+    if [[ $rc -eq 0 ]]; then
+      echo "✔ CT ${ctid}: volume migration complete. Backups in ${backup_dir}."
+    else
+      echo "⚠ CT ${ctid}: migration finished WITH ERRORS (see above). Backups in ${backup_dir}."
+    fi
+    if [[ ${#orphans[@]} -gt 0 ]]; then
+      echo
+      echo "The original named volumes are LEFT IN PLACE as a rollback net."
+      echo "Once the apps are confirmed healthy, remove them:"
+      printf '  pct exec %s -- docker volume rm' "$ctid"
+      printf ' %s' "${orphans[@]}"
+      echo
+    fi
+  else
+    echo "Dry-run only. Re-run with --apply to perform the migration above."
+  fi
+  if [[ ${#anons[@]} -gt 0 ]]; then
+    echo
+    echo "Anonymous volumes were NOT migrated (ambiguous to rewrite) — handle by hand:"
+    printf '  %s\n' "${anons[@]}"
+  fi
+  if [[ -n "$noproj" ]]; then
+    echo
+    echo "Volumes on non-compose containers (no project label) — not handled here:"
+    printf '  %s\n' "$noproj"
+  fi
+  echo
+  echo "Next: re-check with  check_volumes ${ctid}  then  convert_to_standard ${ctid}"
+  return $rc
+}
+
+# Run migrate_volumes_to_binds across every CT tagged '${DOCKER_TAG}', skipping
+# protected ones. DRY-RUN by default; pass --apply to commit.
+# Usage: migrate_all_volumes [--apply] [--force]
+migrate_all_volumes() {
+  local ctid
+  for ctid in $(pct list | awk 'NR>1 {print $1}'); do
+    _ct_has_tag "$ctid" "$DOCKER_TAG" || continue
+    if _ct_is_protected "$ctid"; then
+      echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — skipping."
+      continue
+    fi
+    migrate_volumes_to_binds "$ctid" "$@"
+  done
 }

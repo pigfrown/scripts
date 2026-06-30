@@ -254,6 +254,29 @@ _sed_escape_re() { printf '%s' "$1" | sed 's/[^[:alnum:]_-]/\\&/g'; }
 # '#'): backslash, ampersand and the delimiter itself. Usage: _sed_escape_repl
 _sed_escape_repl() { printf '%s' "$1" | sed 's/[&\\#]/\\&/g'; }
 
+# Scan a compose file (inside a container) for long-form YAML volume/bind blocks
+# whose `source:` value matches any of the given strings.  Long-form blocks
+# (type: bind/volume + source: + target:) cannot be rewritten by the short-form
+# sed patterns used by convert_to_standard and migrate_volumes_to_binds.
+# Prints each matching source: line from the file. Returns 1 if any match, 0 if clear.
+# Usage: _compose_longform_sources <ctid> <cf_path_in_ct> <val>...
+_compose_longform_sources() {
+  local ctid="$1" cf="$2"; shift 2
+  [[ $# -eq 0 ]] && return 0
+  local found=0 val esc hits
+  for val in "$@"; do
+    esc=$(_sed_escape_re "$val")
+    hits=$(pct exec "$ctid" -- grep -E \
+      "^[[:space:]]+source:[[:space:]]+(\"${esc}\"|'${esc}'|${esc})[[:space:]]*$" \
+      "$cf" </dev/null 2>/dev/null || true)
+    if [[ -n "$hits" ]]; then
+      printf '%s\n' "$hits"
+      found=1
+    fi
+  done
+  return $found
+}
+
 # Convert a container to the standard layout:
 #   /opt/<project>/docker-compose.yml  with the compose file and its config
 #   binds under /opt/<project>, and persistent data centralised under a shared
@@ -492,6 +515,21 @@ convert_to_standard() {
       fi
     done
 
+    # Pre-flight: long-form YAML volume/bind syntax cannot be rewritten by the sed
+    # patterns below — catch it before touching the running stack.
+    if [[ ${#volmoves[@]} -gt 0 ]]; then
+      local lf_srcs=() lf_hits
+      for m in "${volmoves[@]}"; do lf_srcs+=("${m%%|*}"); done
+      lf_hits=$(_compose_longform_sources "$ctid" "$cf" "${lf_srcs[@]}")
+      if [[ -n "$lf_hits" ]]; then
+        echo "  ! ${cf} uses long-form YAML volume syntax for source(s) that need rewriting:"
+        printf '%s\n' "$lf_hits"
+        echo "    The sed rewrite only handles short-form (- /src:/dst[:mode])."
+        echo "    Convert these entries to short-form, then re-run convert_to_standard."
+        return 2
+      fi
+    fi
+
     _ct_step "$ctid" "$apply" "backup compose+workdir to ${backup_dir}/${proj}" \
       "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' --one-file-system -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
 
@@ -708,6 +746,24 @@ migrate_volumes_to_binds() {
     if [[ -z "$named_unique" ]]; then
       echo "  -> no named volumes to migrate in this project."
       continue
+    fi
+
+    # Pre-flight: long-form YAML volume syntax cannot be rewritten by the sed
+    # patterns below — catch it before touching the running stack.
+    local lf_vals=() lf_hits short
+    while IFS= read -r vname; do
+      [[ -z "$vname" ]] && continue
+      lf_vals+=("$vname")
+      short="${vname#"${proj}"_}"
+      [[ "$short" != "$vname" && -n "$short" ]] && lf_vals+=("$short")
+    done <<< "$named_unique"
+    lf_hits=$(_compose_longform_sources "$ctid" "$cf" "${lf_vals[@]}")
+    if [[ -n "$lf_hits" ]]; then
+      echo "  ! ${cf} uses long-form YAML volume syntax for source(s) that need rewriting:"
+      printf '%s\n' "$lf_hits"
+      echo "    The sed rewrite only handles short-form (- volname:/dest[:mode])."
+      echo "    Convert these entries to short-form, then re-run migrate_volumes_to_binds."
+      rc=1; continue
     fi
 
     # --- apply-only pre-flight: don't clobber existing target dirs ---

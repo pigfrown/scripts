@@ -975,3 +975,207 @@ migrate_all_volumes() {
     migrate_volumes_to_binds "$ctid" "$@"
   done
 }
+
+# Write content to a file inside a container, with dry-run support.
+# Content is base64-encoded on the host so it survives all quoting layers.
+# Usage: _ct_write_file <ctid> <apply 0|1> <desc> <dest_path> <content>
+_ct_write_file() {
+  local ctid="$1" apply="$2" desc="$3" path="$4" content="$5"
+  if [[ "$apply" -eq 1 ]]; then
+    echo "  + ${desc}"
+    local b64
+    b64=$(printf '%s' "$content" | base64 -w0)
+    if ! pct exec "$ctid" -- bash -c "printf '%s' '${b64}' | base64 -d > '${path}'" </dev/null; then
+      echo "  ! FAILED: ${desc}" >&2
+      return 1
+    fi
+  else
+    echo "  [dry-run] ${desc} -> ${path}"
+    printf '%s\n' "$content" | sed 's/^/        /'
+  fi
+}
+
+# Add a Caddy HTTPS reverse-proxy service to a standardised Docker CT.
+#
+# Reads /opt/docker-compose.yml, detects the app service name and upstream port,
+# creates /opt/caddy/{data,config,Caddyfile}, and appends a caddy service to the
+# compose file. The Caddyfile reverse-proxies to <service>:<port> over the
+# internal Docker network, using certs from /opt/certs/ (mounted at /certs).
+#
+# Cert files are auto-detected by name (crt/cert vs prv/key/private) and default
+# to crt.pem / prv.pem if no .pem files are present yet.
+#
+# DRY-RUN by default — prints what would be written/run. Pass --apply to commit.
+# Pass --port <N> to override the auto-detected upstream port.
+#
+# Usage: add_caddy <CTID-or-name> [--apply] [--port <N>]
+add_caddy() {
+  local apply=0 port_override="" a args=()
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    case "$a" in
+      --apply)   apply=1 ;;
+      --port)    port_override=$2; shift ;;
+      --port=*)  port_override=${a#--port=} ;;
+      *)         args+=("$a") ;;
+    esac
+    shift
+  done
+
+  local ctid pct_conf ct_hostname
+  ctid=$(_resolve_ctid "${args[0]:-}") || return 2
+  pct_conf=$(pct config "$ctid")
+  ct_hostname=$(awk '/^hostname:/{print $2}' <<< "$pct_conf")
+
+  if ! ct_has_docker "$ctid"; then
+    echo "CT ${ctid}: no docker — not applicable." >&2
+    return 2
+  fi
+
+  if ! pct exec "$ctid" -- bash -c '[ -f /opt/docker-compose.yml ]' </dev/null; then
+    echo "CT ${ctid}: /opt/docker-compose.yml not found — run convert_to_standard first." >&2
+    return 2
+  fi
+
+  if pct exec "$ctid" -- bash -c 'grep -qE "^  caddy:" /opt/docker-compose.yml' </dev/null; then
+    echo "CT ${ctid}: caddy service already present in /opt/docker-compose.yml." >&2
+    return 2
+  fi
+
+  local mode="DRY-RUN"
+  [[ $apply -eq 1 ]] && mode="APPLY"
+  echo "=== add_caddy CT ${ctid} [${mode}] ==="
+
+  # --- Discover the first non-caddy app service name ---
+  local service_name
+  service_name=$(pct exec "$ctid" -- bash -c '
+    awk "/^services:/{s=1;next}
+         s && /^  [a-zA-Z_][a-zA-Z0-9_-]*:/{
+           sub(/:$/,\"\",$1)
+           if ($1 != \"caddy\") { print $1; exit }
+         }" /opt/docker-compose.yml
+  ' </dev/null)
+
+  if [[ -z "$service_name" ]]; then
+    echo "CT ${ctid}: could not determine app service name from /opt/docker-compose.yml." >&2
+    return 2
+  fi
+
+  # --- Discover the app's upstream port ---
+  local port
+  if [[ -n "$port_override" ]]; then
+    port="$port_override"
+  else
+    # Extract the rightmost port number from port-mapping lines (host:container),
+    # ignoring 443 which belongs to caddy itself.
+    port=$(pct exec "$ctid" -- bash -c '
+      grep -E "^\s+- [\"'"'"']?[0-9.:]+:[0-9]" /opt/docker-compose.yml |
+      grep -v ":443" |
+      sed "s/.*:\([0-9]*\)[\"'"'"' ]*$/\1/" |
+      head -1
+    ' </dev/null)
+    if [[ -z "$port" ]]; then
+      echo "CT ${ctid}: could not detect app port — pass --port <N>." >&2
+      return 2
+    fi
+  fi
+
+  # --- Detect cert/key basenames under /opt/certs ---
+  local crt_file prv_file
+  crt_file=$(pct exec "$ctid" -- bash -c '
+    f=$(find /opt/certs -maxdepth 1 -name "*.pem" 2>/dev/null | grep -iE "crt|cert" | head -1)
+    [ -n "$f" ] && basename "$f"
+  ' </dev/null)
+  prv_file=$(pct exec "$ctid" -- bash -c '
+    f=$(find /opt/certs -maxdepth 1 -name "*.pem" 2>/dev/null | grep -iE "prv|key|private" | head -1)
+    [ -n "$f" ] && basename "$f"
+  ' </dev/null)
+  crt_file="${crt_file:-crt.pem}"
+  prv_file="${prv_file:-prv.pem}"
+
+  local site="${ct_hostname}.home.arpa"
+
+  echo "  service : ${service_name}"
+  echo "  port    : ${port}"
+  echo "  site    : ${site}"
+  echo "  crt     : /certs/${crt_file}"
+  echo "  prv     : /certs/${prv_file}"
+  echo
+
+  # --- Build Caddyfile ---
+  local caddyfile
+  caddyfile="$(cat <<EOF
+(certs) {
+    tls /certs/${crt_file} /certs/${prv_file}
+}
+
+${site} {
+    import certs
+    reverse_proxy ${service_name}:${port}
+}
+EOF
+)"
+
+  # --- Build caddy service YAML ---
+  local caddy_svc
+  caddy_svc="$(cat <<'EOF'
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - 443:443
+      - 443:443/udp
+    volumes:
+      - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/certs:/certs:ro
+      - /opt/caddy/data:/data
+      - /opt/caddy/config:/config
+EOF
+)"
+
+  # --- Steps ---
+  _ct_step "$ctid" "$apply" \
+    "create /opt/caddy/{data,config}" \
+    "mkdir -p /opt/caddy/data /opt/caddy/config" || return 1
+
+  _ct_write_file "$ctid" "$apply" \
+    "write /opt/caddy/Caddyfile" \
+    "/opt/caddy/Caddyfile" \
+    "$caddyfile" || return 1
+
+  # Append caddy service — base64-encode to survive all quoting layers
+  if [[ $apply -eq 1 ]]; then
+    echo "  + append caddy service to /opt/docker-compose.yml"
+    local b64
+    b64=$(printf '%s' "$caddy_svc" | base64 -w0)
+    if ! pct exec "$ctid" -- bash -c "
+      printf '\n' >> /opt/docker-compose.yml
+      printf '%s' '${b64}' | base64 -d >> /opt/docker-compose.yml
+    " </dev/null; then
+      echo "  ! FAILED: append caddy service to /opt/docker-compose.yml" >&2
+      return 1
+    fi
+  else
+    echo "  [dry-run] append caddy service to /opt/docker-compose.yml"
+    printf '%s\n' "$caddy_svc" | sed 's/^/        /'
+  fi
+
+  _ct_step "$ctid" "$apply" \
+    "docker-compose up -d caddy" \
+    "cd /opt && docker-compose up -d caddy" || return 1
+
+  echo
+  if [[ $apply -eq 1 ]]; then
+    echo "✔ CT ${ctid}: caddy added. Browse: https://${site}"
+    if ! pct exec "$ctid" -- bash -c \
+        "[ -f '/opt/certs/${crt_file}' ] && [ -f '/opt/certs/${prv_file}' ]" </dev/null 2>/dev/null; then
+      echo
+      echo "  ⚠ cert file(s) not yet in /opt/certs/ — Caddy will not start until they are."
+      echo "    Expected: /opt/certs/${crt_file}  and  /opt/certs/${prv_file}"
+      echo "    Then: pct exec ${ctid} -- docker restart caddy"
+    fi
+  else
+    echo "Dry-run only. Re-run with --apply to apply."
+  fi
+}

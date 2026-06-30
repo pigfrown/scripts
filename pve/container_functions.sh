@@ -193,7 +193,7 @@ _ct_replace_tag_prefix() {
 #   tmplver-N   (e.g. tmplver-1, tmplver-2)
 #
 # Containers deployed by redeploy_lxc get a corresponding tag:
-#   from-<tmplCTID>-v<N>   (e.g. from-118-v2)
+#   from-<tmplCTID>-v<N>   (e.g. from-999-v2)
 #
 # Use lxc_template_status to see which containers are current or stale.
 

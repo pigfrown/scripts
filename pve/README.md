@@ -31,9 +31,9 @@ It prints the resulting archive path on **stdout** and nothing else (vzdump's
 progress and the success line go to stderr), so you can capture it:
 
 ```bash
-backup_lxc 118                       # back up, using BACKUP_* defaults
-file=$(backup_lxc 118)               # capture the archive path
-backup_lxc 118 --mode stop --keep 5  # cold dump, keep the last 5
+backup_lxc 101                       # back up, using BACKUP_* defaults
+file=$(backup_lxc 101)               # capture the archive path
+backup_lxc 101 --mode stop --keep 5  # cold dump, keep the last 5
 ```
 
 Defaults come from these env vars (override in your shell):
@@ -74,8 +74,8 @@ act on using two tags:
 > **eligible = tagged `docker`  AND NOT tagged `noauto`**
 
 ```bash
-pct set 118 --tags docker          # opt CT 118 in
-pct set 118 --tags docker;noauto   # in the fleet, but temporarily protected
+pct set 101 --tags docker          # opt CT 101 in
+pct set 101 --tags docker;noauto   # in the fleet, but temporarily protected
 ```
 
 `pct set --tags` **replaces** the whole tag list, so always pass every tag you
@@ -83,7 +83,7 @@ want the CT to keep.
 
 Notes:
 
-- **Single-CT calls** (`convert_to_standard 118`, `validate_docker_pattern 118`)
+- **Single-CT calls** (`convert_to_standard 101`, `validate_docker_pattern 101`)
   ignore the `docker` allowlist — calling them by ID is itself opt-in — but
   `convert_to_standard` still **refuses** a `noauto` container.
 - The `docker` tag is just an eligibility flag; the functions still verify
@@ -158,8 +158,8 @@ drifted from a stock Debian + template:
 - unpackaged files in config dirs (custom units, `cron.d`, `/usr/local` scripts, user crontabs).
 
 ```bash
-ct_changed_files 118                       # see what drifted
-$EDITOR /etc/pve/redeploy/118.preserve     # list the paths worth keeping
+ct_changed_files 101                       # see what drifted
+$EDITOR /etc/pve/redeploy/101.preserve     # list the paths worth keeping
 ```
 
 > Tip: the cleanest fix is to *eliminate* the manifest — fold reverse proxies
@@ -187,10 +187,10 @@ keep-last=$REDEPLOY_BACKUP_KEEP` (default **3**), so only the last N backups per
 CT are kept and old ones are pruned — they won't silently fill the disk.
 
 ```bash
-list_backups 118             # what's held for CT 118
-rollback_lxc 118             # restore the newest (then: pct start 118)
-rollback_lxc 118 /var/lib/vz/dump/vzdump-lxc-118-2026_06_30-10_00_00.tar.zst   # a specific one
-rollback_lxc 118 <file> --storage=local-lvm   # force the rootfs storage
+list_backups 101             # what's held for CT 101
+rollback_lxc 101             # restore the newest (then: pct start 101)
+rollback_lxc 101 /var/lib/vz/dump/vzdump-lxc-101-2026_06_30-10_00_00.tar.zst   # a specific one
+rollback_lxc 101 <file> --storage=local-lvm   # force the rootfs storage
 ```
 
 `rollback_lxc` restores the rootfs to the CT's current rootfs storage (detected
@@ -204,10 +204,10 @@ saved config back on → start → restore `/opt` (+ preserved paths, then reboo
 command to recover.
 
 ```bash
-redeploy_lxc 118              # preview what would happen
-redeploy_lxc 118 --apply      # rebuild CT 118 from template 999
-redeploy_lxc 118 debian13 --apply   # rebuild from a named template
-rollback_lxc 118             # undo: restore the pre-redeploy backup
+redeploy_lxc 101              # preview what would happen
+redeploy_lxc 101 --apply      # rebuild CT 101 from template 999
+redeploy_lxc 101 debian13 --apply   # rebuild from a named template
+rollback_lxc 101             # undo: restore the pre-redeploy backup
 ```
 
 Config (env vars): `REDEPLOY_TEMPLATE` (default 999), `REDEPLOY_BACKUP_STORAGE`
@@ -250,13 +250,13 @@ backed-up compose file and `up -d`.
 Intended order — **always dry-run first**:
 
 ```bash
-check_volumes 118                       # see what's in volumes
-migrate_volumes_to_binds 118            # preview the migration
-migrate_volumes_to_binds 118 --apply    # copy data, rewrite compose, verify
-check_volumes 118                       # confirm: no volumes left
-convert_to_standard 118 --apply         # now it proceeds
+check_volumes 101                       # see what's in volumes
+migrate_volumes_to_binds 101            # preview the migration
+migrate_volumes_to_binds 101 --apply    # copy data, rewrite compose, verify
+check_volumes 101                       # confirm: no volumes left
+convert_to_standard 101 --apply         # now it proceeds
 # once happy:
-pct exec 118 -- docker volume rm <name> # remove the old (now-orphaned) volumes
+pct exec 101 -- docker volume rm <name> # remove the old (now-orphaned) volumes
 ```
 
 Config: `DOCKER_MIGRATE_IMAGE` (default `alpine`) — the throwaway image used to
@@ -279,6 +279,6 @@ It **aborts on the first failed step** (after `--apply`) so you can inspect.
 Always run it without `--apply` first and read the plan.
 
 ```bash
-convert_to_standard 118            # preview
-convert_to_standard 118 --apply    # do it (after backup)
+convert_to_standard 101            # preview
+convert_to_standard 101 --apply    # do it (after backup)
 ```

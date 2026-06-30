@@ -1065,11 +1065,11 @@ add_caddy() {
   # --- Discover the first non-caddy app service name ---
   local service_name
   service_name=$(pct exec "$ctid" -- bash -c '
-    awk "/^services:/{s=1;next}
+    awk '"'"'/^services:/{s=1;next}
          s && /^  [a-zA-Z_][a-zA-Z0-9_-]*:/{
-           sub(/:$/,\"\",$1)
-           if ($1 != \"caddy\") { print $1; exit }
-         }" /opt/docker-compose.yml
+           sub(/:$/,"",$1)
+           if ($1 != "caddy") { print $1; exit }
+         }'"'"' /opt/docker-compose.yml
   ' </dev/null)
 
   if [[ -z "$service_name" ]]; then

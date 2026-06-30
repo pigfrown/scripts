@@ -24,10 +24,14 @@ _DOCKER_FUNCS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PVE tags that drive eligibility for the bulk helpers:
 #   DOCKER_TAG          allowlist — only CTs carrying it are considered
 #   DOCKER_PROTECT_TAG  denylist  — CTs carrying it are NEVER acted on
+#   DOCKER_STANDARD_TAG marker    — set by convert_to_standard once a CT has
+#                                   been moved to the standard /opt/<app> layout;
+#                                   redeploy_lxc requires it before it will run.
 # Tag a CT with e.g.:  pct set <id> --tags docker
 # (note: --tags REPLACES the whole list, so include all: --tags docker;noauto)
 DOCKER_TAG="${DOCKER_TAG:-docker}"
 DOCKER_PROTECT_TAG="${DOCKER_PROTECT_TAG:-noauto}"
+DOCKER_STANDARD_TAG="${DOCKER_STANDARD_TAG:-docker-standardised}"
 
 # True if the container's config carries the given tag.
 # Usage: _ct_has_tag <CTID> <tag>
@@ -40,6 +44,17 @@ _ct_has_tag() {
 # True if the container carries the protect (denylist) tag.
 # Usage: _ct_is_protected <CTID>
 _ct_is_protected() { _ct_has_tag "$1" "$DOCKER_PROTECT_TAG"; }
+
+# Add a tag to a container, preserving its existing tags. No-op if already set.
+# (pct set --tags REPLACES the whole list, so we read, append, and write back.)
+# Usage: _ct_add_tag <CTID> <tag>
+_ct_add_tag() {
+  local ctid="$1" tag="$2" tags
+  _ct_has_tag "$ctid" "$tag" && return 0
+  tags=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^tags:/{print $2}')
+  [[ -n "$tags" ]] && tags="${tags};${tag}" || tags="$tag"
+  pct set "$ctid" --tags "$tags"
+}
 
 # True if the container has docker installed and the daemon is running.
 # Usage: ct_has_docker <CTID-or-name>
@@ -413,6 +428,11 @@ convert_to_standard() {
   echo
   if [[ $apply -eq 1 ]]; then
     echo "✔ CT ${ctid}: conversion applied. Backups in ${backup_dir}."
+    if _ct_add_tag "$ctid" "$DOCKER_STANDARD_TAG"; then
+      echo "  tagged '${DOCKER_STANDARD_TAG}' — now eligible for redeploy_lxc."
+    else
+      echo "  warning: failed to set '${DOCKER_STANDARD_TAG}' tag — redeploy_lxc will refuse until it is set." >&2
+    fi
   else
     echo "Dry-run only. Re-run with --apply to perform the changes above."
   fi

@@ -115,6 +115,16 @@ redeploy_lxc() {
     return 2
   fi
 
+  # Redeploy assumes the standard /opt/<app> docker layout (see docker_functions.sh):
+  # /opt is the only payload carried across, so a docker CT that hasn't been through
+  # convert_to_standard would not come back up correctly. Gate on the marker tag:
+  # docker-tagged but not yet standardised => refuse.
+  if _ct_has_tag "$ctid" "$DOCKER_TAG" && ! _ct_has_tag "$ctid" "$DOCKER_STANDARD_TAG"; then
+    echo "CT ${ctid}: tagged '${DOCKER_TAG}' but not '${DOCKER_STANDARD_TAG}' —" \
+         "run convert_to_standard first; refusing to redeploy." >&2
+    return 2
+  fi
+
   [[ -f "/etc/pve/lxc/${ctid}.conf" ]]     || { echo "No such CT: ${ctid}" >&2; return 1; }
   [[ -f "/etc/pve/lxc/${template}.conf" ]] || { echo "No such template: ${template}" >&2; return 1; }
 

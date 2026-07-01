@@ -5,6 +5,7 @@
 #   - same CTID
 #   - same MAC / VLAN / bridge / IP (net lines copied verbatim)
 #   - same bind-mount points (host paths survive destroy, re-attached)
+#   - same device passthrough (dev0/dev1/... lines, e.g. GPU/Coral/etc.)
 #   - same idmap / raw lxc.* lines
 #   - same /opt payload (tar'd off the old rootfs, restored into the new one)
 #
@@ -168,8 +169,9 @@ redeploy_lxc() {
   arch=$(sed -n 's/^arch: //p' <<<"$old")
   tags=$(sed -n 's/^tags: //p' <<<"$old")
   startup=$(sed -n 's/^startup: //p' <<<"$old")
-  local net_lines idmap_lines lxc_lines
+  local net_lines idmap_lines lxc_lines dev_lines
   mapfile -t net_lines   < <(grep -E '^net[0-9]+:' <<<"$old")
+  mapfile -t dev_lines   < <(grep -E '^dev[0-9]+:' <<<"$old")
   mapfile -t idmap_lines < <(grep -E '^lxc\.idmap:' <<<"$old")
   mapfile -t lxc_lines   < <(grep -E '^lxc\.' <<<"$old")
   local preserve_paths
@@ -188,6 +190,7 @@ redeploy_lxc() {
 EOF
   printf '  net      : %s\n' "${net_lines[@]:-(template)}"
   if (( ${#bind_mps[@]} )); then printf '  bind mp  : %s\n' "${bind_mps[@]//|/ }"; else echo "  bind mp  : (none)"; fi
+  if (( ${#dev_lines[@]} )); then printf '  passthru : %s\n' "${dev_lines[@]}"; else echo "  passthru : (none)"; fi
   if (( ${#idmap_lines[@]} )); then printf '  idmap    : %s\n' "${idmap_lines[@]}"; else echo "  idmap    : (none)"; fi
   if (( ${#preserve_paths[@]} )); then
     echo "  preserve : ${REDEPLOY_PRESERVE_DIR}/${ctid}.preserve"
@@ -265,6 +268,7 @@ EOF
   [[ -n "$tags" ]]     && set_args+=(--tags "$tags")
   for l in "${net_lines[@]}"; do set_args+=("--net${i}" "${l#*: }"); ((i++)); done
   for l in "${bind_mps[@]}"; do set_args+=("--${l%%|*}" "${l#*|}"); done
+  for l in "${dev_lines[@]}"; do set_args+=("--${l%%:*}" "${l#*: }"); done
   pct "${set_args[@]}" \
     || { echo "pct set failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 

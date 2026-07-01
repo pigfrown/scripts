@@ -42,6 +42,21 @@ _resolve_ctid() {
   echo "$ctid"
 }
 
+# Interpret a tar exit code: 0 = clean, 1 = non-fatal warning (most commonly
+# "file changed as we read it" on a live file — the archive is still usable),
+# >=2 = a real, fatal error. Prints a note/error and returns 0/1 accordingly.
+# Usage: _tar_check <exit-code> <label-for-messages>
+_tar_check() {
+  local rc="$1" label="$2"
+  if (( rc > 1 )); then
+    echo "${label} failed (exit ${rc})" >&2
+    return 1
+  elif (( rc == 1 )); then
+    echo "  note: ${label} reported changed files during archive (likely a live file) — continuing" >&2
+  fi
+  return 0
+}
+
 # Update a Debian container: apt update / upgrade / autoremove.
 # Usage: update_debian <CTID-or-name>
 update_debian() {

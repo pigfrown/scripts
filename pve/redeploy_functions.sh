@@ -215,8 +215,8 @@ EOF
   pct exec "$ctid" -- bash -c 'systemctl stop docker docker.socket 2>/dev/null || true' </dev/null
 
   echo "[2] Archiving /opt -> ${optfile}..."
-  pct exec "$ctid" -- tar czf - --one-file-system -C / opt </dev/null > "$optfile" \
-    || { echo "tar /opt failed" >&2; return 1; }
+  pct exec "$ctid" -- tar czf - --one-file-system -C / opt </dev/null > "$optfile"
+  _tar_check $? "tar /opt" || return 1
 
   if (( ${#preserve_paths[@]} )); then
     echo "[2b] Archiving preserved base-system paths..."
@@ -229,8 +229,8 @@ EOF
       fi
     done
     if (( ${#keep[@]} )); then
-      pct exec "$ctid" -- tar czf - -C / "${keep[@]}" </dev/null > "$preservefile" \
-        || { echo "preserve tar failed" >&2; return 1; }
+      pct exec "$ctid" -- tar czf - -C / "${keep[@]}" </dev/null > "$preservefile"
+      _tar_check $? "preserve tar" || return 1
     fi
   fi
 
@@ -281,13 +281,15 @@ EOF
   _ct_wait_ready "$ctid" || { echo "CT ${ctid} did not come up — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 
   echo "[8] Restoring /opt..."
-  pct exec "$ctid" -- tar xzf - -C / < "$optfile" \
-    || { echo "restore /opt failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
+  pct exec "$ctid" -- tar xzf - -C / < "$optfile"
+  _tar_check $? "restore /opt" \
+    || { echo "  roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
 
   if [[ -s "$preservefile" ]]; then
     echo "[8b] Restoring preserved base-system paths..."
-    pct exec "$ctid" -- tar xzf - -C / < "$preservefile" \
-      || { echo "restore preserve failed — roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
+    pct exec "$ctid" -- tar xzf - -C / < "$preservefile"
+    _tar_check $? "restore preserve" \
+      || { echo "  roll back: rollback_lxc ${ctid} ${backup_file}" >&2; return 1; }
     echo "[8c] Reloading systemd + rebooting to activate restored services..."
     pct exec "$ctid" -- systemctl daemon-reload </dev/null 2>/dev/null || true
     pct reboot "$ctid" 2>/dev/null || { pct stop "$ctid"; pct start "$ctid"; }

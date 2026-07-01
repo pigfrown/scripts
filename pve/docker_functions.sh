@@ -230,6 +230,11 @@ check_all_volumes() {
   done
 }
 
+# Appended after a `tar` invocation inside a _ct_step command string, so a
+# non-fatal tar warning (exit 1, e.g. "file changed as we read it" on a live
+# file) doesn't fail the whole step. Real tar errors (exit >=2) still fail it.
+_TAR_GUARD='; rc=$?; if [ "$rc" -gt 1 ]; then exit "$rc"; elif [ "$rc" -eq 1 ]; then echo "  note: tar reported changed files during archive (likely a live file) -- continuing" >&2; fi'
+
 # Print a step, then either run it in the container (apply) or just show it.
 # Returns non-zero if the executed command fails.
 # Usage: _ct_step <ctid> <apply 0|1> <description> <command>
@@ -552,7 +557,7 @@ convert_to_standard() {
     fi
 
     _ct_step "$ctid" "$apply" "backup compose+workdir to ${backup_dir}/${proj}" \
-      "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' --one-file-system -C '$(dirname "$wd")' '$(basename "$wd")'" || return 1
+      "mkdir -p '${backup_dir}/${proj}' && cp '${cf}' '${backup_dir}/${proj}/' && tar czf '${backup_dir}/${proj}/workdir.tgz' --one-file-system -C '$(dirname "$wd")' '$(basename "$wd")'${_TAR_GUARD}" || return 1
 
     _ct_step "$ctid" "$apply" "compose down" \
       "cd '${wd}' && docker-compose -f '${cf}' -p '${proj}' down" || return 1
@@ -835,7 +840,7 @@ migrate_volumes_to_binds() {
       while IFS= read -r vname; do
         [[ -z "$vname" ]] && continue
         _ct_step "$ctid" "$apply" "backup volume ${vname} -> ${backup_dir}/${proj}/vol-${vname}.tgz" \
-          "docker run --rm -v '${vname}:/v:ro' -v '${backup_dir}/${proj}:/b' '${DOCKER_MIGRATE_IMAGE}' tar czf '/b/vol-${vname}.tgz' -C /v ." \
+          "docker run --rm -v '${vname}:/v:ro' -v '${backup_dir}/${proj}:/b' '${DOCKER_MIGRATE_IMAGE}' tar czf '/b/vol-${vname}.tgz' -C /v .${_TAR_GUARD}" \
           || { pfail=1; break; }
       done <<< "$named_unique"
     fi

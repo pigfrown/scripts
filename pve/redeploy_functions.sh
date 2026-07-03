@@ -92,17 +92,18 @@ ct_changed_files() {
 
 # Redeploy a container from a template.
 # DRY-RUN by default; pass --apply to actually do it.
-# Usage: redeploy_lxc <CTID-or-name> [template-CTID-or-name] [--apply]
+# Usage: redeploy_lxc <CTID-or-name> [template-CTID-or-name] [--apply] [--force-unhandled]
 redeploy_lxc() {
   if [[ $EUID -ne 0 ]]; then
     echo "Run as root on the Proxmox host" >&2
     return 1
   fi
 
-  local apply=0 a pos=()
+  local apply=0 force_unhandled=0 a pos=()
   for a in "$@"; do
     case "$a" in
       --apply) apply=1 ;;
+      --force-unhandled) force_unhandled=1 ;;
       *) pos+=("$a") ;;
     esac
   done
@@ -155,6 +156,31 @@ redeploy_lxc() {
     echo "ERROR: CT ${ctid} has storage-backed mount(s) that 'pct destroy' would delete:" >&2
     printf '  %s\n' "${storage_mps[@]}" >&2
     echo "Reassigning CT-owned volumes isn't automated yet — aborting." >&2
+    return 1
+  fi
+
+  # Config keys this script does NOT carry over to the new clone. If any of
+  # these are set on the old CT, redeploy would silently drop them (the new
+  # clone gets the template's value / no value at all) — refuse unless the
+  # caller explicitly acknowledges the loss with --force-unhandled.
+  local unhandled_re='^(cpulimit|cpuunits|nameserver|searchdomain|console|tty|cmode|hookscript|description|protection):'
+  local unhandled_lines=()
+  mapfile -t unhandled_lines < <(grep -E "$unhandled_re" <<<"$old")
+
+  if (( ${#unhandled_lines[@]} )) && ! (( force_unhandled )); then
+    echo >&2
+    echo "########################################################################" >&2
+    echo "# REFUSING TO REDEPLOY CT ${ctid}" >&2
+    echo "#" >&2
+    echo "# This CT's config has setting(s) that redeploy_lxc does NOT preserve:" >&2
+    printf '#   %s\n' "${unhandled_lines[@]}" >&2
+    echo "#" >&2
+    echo "# If you proceed, these will be SILENTLY LOST — the new clone will use" >&2
+    echo "# the template's value (or none at all) instead of the above." >&2
+    echo "#" >&2
+    echo "# Re-run with --force-unhandled to acknowledge this and continue." >&2
+    echo "########################################################################" >&2
+    echo >&2
     return 1
   fi
 

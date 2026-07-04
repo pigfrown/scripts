@@ -426,8 +426,8 @@ clone_lxc() {
 
 === clone_lxc: new CT ${ctid} from template ${template} [${mode}] ===
   hostname : ${hostname}
-  storage  : ${storage:-(template's)}
-  net0     : ${net0:-(template's, unchanged)}
+  storage  : ${storage:-(template default)}
+  net0     : ${net0:-(template default, unchanged)}
   tags     : ${new_tags:-(none)}
   identity : SSH host keys + /etc/machine-id regenerated, then rebooted
 EOF

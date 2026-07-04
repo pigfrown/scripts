@@ -169,10 +169,14 @@ $EDITOR /etc/pve/redeploy/101.preserve     # list the paths worth keeping
 | Function | What it does |
 | --- | --- |
 | `redeploy_lxc <ct> [template] [--apply]` | The rebuild. **Dry-run by default** (prints exactly what it will carry over, including preserved paths). Template defaults to `$REDEPLOY_TEMPLATE` (999). Refuses protected (`noauto`) CTs and unprivileged-mismatched templates. Stamps a `from-<tmplCTID>-v<N>` tag on the CT on success. |
+| `clone_lxc <hostname> [template] [--ctid N] [--net0 STR] [--storage S] [--apply]` | Clone a **brand-new** LXC from a template (new CTID, not a drop-in replacement). Auto-picks the next free CTID, stamps the `from-<tmplCTID>-v<N>` tag, and regenerates SSH host keys + `/etc/machine-id` so clones don't share identity. **Dry-run by default.** |
 | `lxc_template_status [ct ...]` | Show which containers are current or stale vs. their template version. With no args, scans all CTs with a `from-*` tag. |
 | `rollback_lxc <ct> [backup]` | Restore from the vzdump taken during redeploy. With no file, uses the latest backup for that CTID. Leaves the CT stopped. |
 | `list_backups <ct>` | List the vzdump backups held for a CT on the backup storage. |
 | `ct_changed_files <ct>` | Show base-system drift (modified package files + unpackaged config files) to help build the preserve manifest. |
+| `check_lxc_identity [ct ...]` | Report CTs sharing a machine-id or SSH host key fingerprint (default: every running CT). |
+| `fix_lxc_identity <ct> [--apply]` | Regenerate SSH host keys + machine-id on an existing CT, then reboot. **Dry-run by default.** |
+| `fix_all_lxc_identity [--apply]` | Run `fix_lxc_identity` across every running, non-template, non-protected CT. |
 
 ### Backups: storage, retention, rollback
 
@@ -213,6 +217,63 @@ rollback_lxc 101             # undo: restore the pre-redeploy backup
 Config (env vars): `REDEPLOY_TEMPLATE` (default 999), `REDEPLOY_BACKUP_STORAGE`
 (default `local`, needs "backup" content), `REDEPLOY_CLONE_STORAGE` (blank =
 template's storage), `REDEPLOY_PRESERVE_DIR` (default `/etc/pve/redeploy`).
+
+### Fresh containers from a template (`clone_lxc`)
+
+Unlike `redeploy_lxc` (rebuild an *existing* CT in place, same CTID/IP/data),
+`clone_lxc` provisions a **new** container from a template — for when you just
+want another instance of the template, not a replacement.
+
+```bash
+clone_lxc plex-test               # preview: new CTID auto-picked, from template 999
+clone_lxc plex-test --apply       # do it
+clone_lxc gitea2 debian13 --apply # clone from a named template
+clone_lxc app01 --ctid 150 --net0 'name=eth0,bridge=vmbr0,tag=20,ip=10.0.20.15/24,gw=10.0.20.1' --apply
+```
+
+What it does beyond a plain `pct clone`:
+
+- **CTID**: auto-picked via `pvesh get /cluster/nextid` unless `--ctid` is given.
+- **Tags**: carries over the template's own tags (minus its `tmplver-N`) and
+  stamps `from-<tmplCTID>-v<N>`, so `lxc_template_status` tracks it from birth.
+- **Identity**: after first boot, regenerates SSH host keys and
+  `/etc/machine-id` (+ `/var/lib/dbus/machine-id`), then reboots. Without this,
+  every clone of a template shares the same host keys and machine-id — which
+  trips SSH host-key-changed warnings between sibling containers and can
+  collide on DHCP client-id / systemd-networkd link identity / journald dedup.
+- **Networking**: `--net0` optionally sets a fresh `net0` (IP/VLAN/bridge) at
+  clone time; otherwise the template's own `net0` is left as-is.
+
+Storage defaults to `$REDEPLOY_CLONE_STORAGE` (same knob `redeploy_lxc` uses).
+
+### Fixing identity on existing containers (`check_lxc_identity` / `fix_lxc_identity`)
+
+`clone_lxc` only regenerates SSH host keys + machine-id for *new* clones. If you
+already have a fleet of containers cloned from the same template the old way,
+they're all sitting on identical SSH host keys and `/etc/machine-id`. These two
+functions find and fix that on existing containers:
+
+```bash
+check_lxc_identity                  # scan every running CT, report collisions
+check_lxc_identity 101 102 103      # scan just these
+
+fix_lxc_identity 101                # preview: regenerate identity on CT 101
+fix_lxc_identity 101 --apply        # do it (reboots the CT)
+
+fix_all_lxc_identity                # preview across the whole fleet
+fix_all_lxc_identity --apply        # fix every running, non-template, non-protected CT
+```
+
+`check_lxc_identity` groups containers by machine-id and by SSH host key
+(ed25519) fingerprint and reports any value shared by more than one CT — that's
+your fix list. Only running containers can be checked (needs `pct exec`);
+stopped ones are listed separately so you know to start them first.
+
+`fix_lxc_identity` / `fix_all_lxc_identity` wipe and regenerate both, then
+reboot the container so every subsystem (sshd, systemd-networkd, journald,
+DHCP client) picks up the new identity. **Dry-run by default**, like everything
+else here. Templates are always skipped (they don't need an identity — only
+their clones do), and protected (`noauto`-tagged) containers are refused.
 
 ### Docker volumes → bind mounts (`migrate_volumes_to_binds`)
 

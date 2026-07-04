@@ -349,6 +349,270 @@ EOF
   [[ -s "$preservefile" ]] && echo "  preserve archive: ${preservefile}"
 }
 
+# Clone a fresh LXC from a template — a brand-new container (new CTID), not a
+# drop-in replacement for an existing one (that's redeploy_lxc).
+#
+# What it adds on top of a plain `pct clone`:
+#   - Auto-picks the next free CTID (`pvesh get /cluster/nextid`) unless --ctid
+#     is given, so you don't need to know a free slot up front.
+#   - Stamps the same from-<tmplCTID>-v<N> tracking tag redeploy_lxc uses (plus
+#     the template's other tags, minus its own tmplver-N), so lxc_template_status
+#     sees freshly-cloned containers too.
+#   - Regenerates SSH host keys and /etc/machine-id after first boot. Every
+#     clone of a template otherwise inherits the exact same host keys and
+#     machine-id, which causes SSH host-key-changed warnings between sibling
+#     containers and can collide on DHCP client-id / systemd-networkd identity
+#     / journald dedup. Then reboots so the new identity is fully in effect.
+#
+# DRY-RUN by default; pass --apply to actually do it.
+# Usage: clone_lxc <hostname> [template-CTID-or-name] [--ctid N] [--net0 STR] [--storage S] [--apply]
+clone_lxc() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Run as root on the Proxmox host" >&2
+    return 1
+  fi
+
+  local apply=0 ctid="" net0="" storage="$REDEPLOY_CLONE_STORAGE" a pos=()
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    case "$a" in
+      --apply)     apply=1 ;;
+      --ctid)      ctid=$2; shift ;;
+      --ctid=*)    ctid=${a#--ctid=} ;;
+      --net0)      net0=$2; shift ;;
+      --net0=*)    net0=${a#--net0=} ;;
+      --storage)   storage=$2; shift ;;
+      --storage=*) storage=${a#--storage=} ;;
+      *)           pos+=("$a") ;;
+    esac
+    shift
+  done
+
+  local hostname="${pos[0]:-}"
+  if [[ -z "$hostname" ]]; then
+    echo "Usage: clone_lxc <hostname> [template-CTID-or-name] [--ctid N] [--net0 STR] [--storage S] [--apply]" >&2
+    return 2
+  fi
+
+  local template
+  template=$(_resolve_ctid "${pos[1]:-$REDEPLOY_TEMPLATE}") || return 2
+  [[ -f "/etc/pve/lxc/${template}.conf" ]] || { echo "No such template: ${template}" >&2; return 1; }
+  grep -q '^template: 1$' "/etc/pve/lxc/${template}.conf" \
+    || { echo "CT ${template} is not a template." >&2; return 1; }
+
+  if [[ -n "$ctid" ]]; then
+    [[ "$ctid" =~ ^[0-9]+$ ]] || { echo "--ctid must be numeric" >&2; return 2; }
+    [[ -f "/etc/pve/lxc/${ctid}.conf" ]] && { echo "CT ${ctid} already exists." >&2; return 1; }
+  else
+    ctid=$(pvesh get /cluster/nextid 2>/dev/null)
+    [[ "$ctid" =~ ^[0-9]+$ ]] \
+      || { echo "Could not auto-allocate a CTID (pvesh get /cluster/nextid failed)." >&2; return 1; }
+  fi
+
+  # Carry the template's own tags across (dropping its tmplver-N), then add
+  # this clone's from-<tmplCTID>-v<N> tracking tag.
+  local tmpl_tags new_tags tmpl_ver from_tag=""
+  tmpl_tags=$(sed -n 's/^tags: //p' "/etc/pve/lxc/${template}.conf")
+  tmpl_ver=$(_tmpl_get_ver "$template")
+  new_tags=$(printf '%s' "$tmpl_tags" | tr ';' '\n' | grep -v '^tmplver-' | grep -v '^$' \
+               | tr '\n' ';' | sed 's/;$//')
+  if (( tmpl_ver > 0 )); then
+    from_tag="from-${template}-v${tmpl_ver}"
+    [[ -n "$new_tags" ]] && new_tags="${new_tags};${from_tag}" || new_tags="$from_tag"
+  fi
+
+  local mode="DRY-RUN"; (( apply )) && mode="APPLY"
+  cat <<EOF
+
+=== clone_lxc: new CT ${ctid} from template ${template} [${mode}] ===
+  hostname : ${hostname}
+  storage  : ${storage:-(template's)}
+  net0     : ${net0:-(template's, unchanged)}
+  tags     : ${new_tags:-(none)}
+  identity : SSH host keys + /etc/machine-id regenerated, then rebooted
+EOF
+  echo
+
+  if ! (( apply )); then
+    echo "Dry-run only. Re-run with --apply to perform the clone."
+    return 0
+  fi
+
+  echo "[1] Cloning template ${template} -> new CT ${ctid}..."
+  local clone_args=(clone "$template" "$ctid" --full --hostname "$hostname")
+  [[ -n "$storage" ]] && clone_args+=(--storage "$storage")
+  pct "${clone_args[@]}" || { echo "clone failed" >&2; return 1; }
+
+  if [[ -n "$new_tags" ]]; then
+    pct set "$ctid" --tags "$new_tags" || echo "  warning: failed to set tags" >&2
+  fi
+
+  if [[ -n "$net0" ]]; then
+    pct set "$ctid" --net0 "$net0" || { echo "pct set --net0 failed" >&2; return 1; }
+  fi
+
+  echo "[2] Starting CT ${ctid}..."
+  pct start "$ctid" || { echo "start failed" >&2; return 1; }
+  _ct_wait_ready "$ctid" || { echo "CT ${ctid} did not come up" >&2; return 1; }
+
+  echo "[3] Regenerating SSH host keys + machine-id, then rebooting..."
+  _ct_regen_identity "$ctid" || echo "  warning: identity regen failed — check manually" >&2
+
+  echo
+  echo "✔ CT ${ctid} (${hostname}) cloned from template ${template}."
+  [[ -n "$from_tag" ]] && echo "  template tag: ${from_tag}"
+  echo "  Check networking: pct exec ${ctid} -- ip a"
+}
+
+# ── Container identity (SSH host keys / machine-id) ─────────────────────────
+#
+# Every CT cloned from the same template starts out with byte-identical SSH
+# host keys and /etc/machine-id — both are just files on the rootfs that got
+# copied. That causes SSH host-key-changed warnings when you reuse an IP/name
+# between sibling containers, and can collide on DHCP client-id, systemd-
+# networkd link identity, and journald/systemd-timesyncd dedup.
+#
+# clone_lxc regenerates both for brand-new clones. check_lxc_identity /
+# fix_lxc_identity(_all) are for containers that already exist — either
+# cloned before this existed, or still sharing identity for some other reason.
+
+# Print a CT's current /etc/machine-id. Empty if unreadable (CT not running, etc).
+_ct_machine_id() { pct exec "$1" -- cat /etc/machine-id </dev/null 2>/dev/null; }
+
+# Print a CT's ed25519 SSH host key fingerprint. Empty if unreadable.
+_ct_ssh_fingerprint() {
+  pct exec "$1" -- ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub </dev/null 2>/dev/null \
+    | awk '{print $2}'
+}
+
+# Wipe and regenerate SSH host keys + machine-id inside a running CT, then
+# reboot so every subsystem picks up the new identity. Usage: _ct_regen_identity <ctid>
+_ct_regen_identity() {
+  local ctid="$1"
+  pct exec "$ctid" -- bash -c '
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A >/dev/null
+    rm -f /etc/machine-id /var/lib/dbus/machine-id
+    systemd-machine-id-setup >/dev/null 2>&1
+    [[ -e /var/lib/dbus/machine-id ]] || ln -sf /etc/machine-id /var/lib/dbus/machine-id
+  ' </dev/null || return 1
+  pct reboot "$ctid" 2>/dev/null || { pct stop "$ctid"; pct start "$ctid"; }
+  _ct_wait_ready "$ctid"
+}
+
+# Report CTs that share a machine-id or an SSH host key fingerprint — the
+# candidates for fix_lxc_identity. Only running CTs can be checked (needs
+# pct exec); stopped ones are listed separately. Templates are skipped.
+# Usage: check_lxc_identity [CTID-or-name ...]   (default: every CT)
+check_lxc_identity() {
+  local targets=("$@") ctid
+  if (( ${#targets[@]} == 0 )); then
+    while IFS= read -r ctid; do targets+=("$ctid"); done \
+      < <(pct list | awk 'NR>1 {print $1}')
+  fi
+
+  local rows=() skipped=() t
+  for t in "${targets[@]}"; do
+    ctid=$(_resolve_ctid "$t") || continue
+    grep -q '^template: 1$' "/etc/pve/lxc/${ctid}.conf" 2>/dev/null && continue
+    if ! pct status "$ctid" 2>/dev/null | grep -q '^status: running$'; then
+      skipped+=("$ctid")
+      continue
+    fi
+    rows+=("${ctid}|$(_ct_machine_id "$ctid")|$(_ct_ssh_fingerprint "$ctid")")
+  done
+
+  if (( ${#skipped[@]} )); then
+    echo "Skipped (not running): ${skipped[*]}"
+  fi
+
+  local field name dupes d
+  for field in 2:machine-id 3:"SSH host key (ed25519 fingerprint)"; do
+    local col=${field%%:*} label=${field#*:}
+    echo
+    echo "=== ${label} collisions ==="
+    dupes=$(printf '%s\n' "${rows[@]}" | awk -F'|' -v c="$col" '{print $c}' | sort | uniq -d)
+    if [[ -z "$dupes" ]]; then
+      echo "  none"
+      continue
+    fi
+    while IFS= read -r d; do
+      [[ -z "$d" ]] && continue
+      printf '  %-44s shared by:' "$d"
+      printf '%s\n' "${rows[@]}" | awk -F'|' -v c="$col" -v d="$d" '$c==d{printf " %s", $1}'
+      echo
+    done <<<"$dupes"
+  done
+}
+
+# Regenerate SSH host keys + machine-id for an EXISTING, already-running
+# container, then reboot. Use this for containers that predate clone_lxc, or
+# that check_lxc_identity flagged as still sharing identity with a sibling.
+# DRY-RUN by default; pass --apply to actually do it.
+# Usage: fix_lxc_identity <CTID-or-name> [--apply]
+fix_lxc_identity() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Run as root on the Proxmox host" >&2
+    return 1
+  fi
+
+  local apply=0 a pos=()
+  for a in "$@"; do
+    case "$a" in
+      --apply) apply=1 ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+
+  local ctid; ctid=$(_resolve_ctid "${pos[0]:-}") || return 2
+
+  if _ct_is_protected "$ctid"; then
+    echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — refusing." >&2
+    return 2
+  fi
+
+  if ! pct status "$ctid" 2>/dev/null | grep -q '^status: running$'; then
+    echo "CT ${ctid}: not running — start it first (pct start ${ctid})." >&2
+    return 1
+  fi
+
+  local mode="DRY-RUN"; (( apply )) && mode="APPLY"
+  echo
+  echo "=== fix_lxc_identity CT ${ctid} [${mode}] ==="
+  echo "  current machine-id : $(_ct_machine_id "$ctid")"
+  echo "  current ssh fp     : $(_ct_ssh_fingerprint "$ctid")"
+  echo "  action: regenerate SSH host keys + machine-id, then reboot"
+  echo
+
+  if ! (( apply )); then
+    echo "Dry-run only. Re-run with --apply to regenerate."
+    return 0
+  fi
+
+  echo "Regenerating identity on CT ${ctid}..."
+  _ct_regen_identity "$ctid" || { echo "identity regen failed on CT ${ctid}" >&2; return 1; }
+  echo "✔ CT ${ctid}: new machine-id $(_ct_machine_id "$ctid"), new ssh fp $(_ct_ssh_fingerprint "$ctid")"
+}
+
+# Run fix_lxc_identity across every running, non-template, non-protected CT.
+# DRY-RUN by default; pass --apply to commit (forwarded to each call).
+# Usage: fix_all_lxc_identity [--apply]
+fix_all_lxc_identity() {
+  local ctid
+  for ctid in $(pct list | awk 'NR>1 {print $1}'); do
+    grep -q '^template: 1$' "/etc/pve/lxc/${ctid}.conf" 2>/dev/null && continue
+    if _ct_is_protected "$ctid"; then
+      echo "CT ${ctid}: protected (tag '${DOCKER_PROTECT_TAG}') — skipping."
+      continue
+    fi
+    if ! pct status "$ctid" 2>/dev/null | grep -q '^status: running$'; then
+      echo "CT ${ctid}: not running — skipping (start it and re-run to fix)."
+      continue
+    fi
+    fix_lxc_identity "$ctid" "$@"
+  done
+}
+
 # Show deployment status for tracked containers vs. their template's current version.
 # Containers without a from-* tag are listed as untracked.
 # Usage: lxc_template_status [CTID-or-name ...]
